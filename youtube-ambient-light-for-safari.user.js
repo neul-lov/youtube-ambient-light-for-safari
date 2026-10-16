@@ -223,6 +223,19 @@
     html.ambl-on ytd-watch-flexy ytd-live-chat-frame {
       background: none !important;
     }
+    /* Comments in a side panel (newer layout): the script marks the panel's opaque layers,
+       so the glow beside the player shines into it. Comments under the video get the wash. */
+    html.ambl-on [data-ambl-panel-root] {
+      background: var(--ambl-box) !important;
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+    }
+    html.ambl-on [data-ambl-panel] {
+      background-color: transparent !important;
+      background-image: none !important;
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+    }
 
     /* Text: a dark halo. text-shadow is inherited, so it is set on large containers, plus on
        buttons and inputs where the browser's default style turns it off */
@@ -844,6 +857,7 @@
     applyReadability();
     if (S.headerTransparent) markHeader();
     if (S.searchClear) markSearchbox();
+    markCommentPanel();
     applyTheme();
     updateAtTop();
 
@@ -948,6 +962,7 @@
     player = null;
     root.classList.remove("ambl-on", "ambl-header-clear", "ambl-search-clear", "ambl-top");
     clearReadability();
+    clearCommentPanel();
     restoreTheme();
     updateStatus();
   }
@@ -1219,6 +1234,62 @@
     washSnap = false;
     wash.has = true;
     paintWash();
+  }
+
+  // Comments in a side panel: its markup differs between YouTube layouts, so instead of class
+  // names the script looks for the outermost opaque layer around a visible comment and marks it
+  // (translucent box) plus the wide opaque layers inside it (transparent). Each element is
+  // checked once; comments loaded later are picked up on the next round.
+  const THREAD_SEL = "ytd-comment-thread-renderer, ytd-comment-view-model, yt-comment-view-model";
+  let panelRoot = null;
+  let panelSeen = new WeakSet();
+
+  function clearCommentPanel() {
+    for (const el of document.querySelectorAll("[data-ambl-panel], [data-ambl-panel-root]")) {
+      el.removeAttribute("data-ambl-panel");
+      el.removeAttribute("data-ambl-panel-root");
+    }
+    panelRoot = null;
+    panelSeen = new WeakSet();
+  }
+
+  function markCommentPanel() {
+    const flexy = S.commentsGlow > 0 ? document.querySelector("ytd-watch-flexy:not([hidden])") : null;
+    let thread = null;
+    if (flexy) {
+      for (const t of flexy.querySelectorAll(THREAD_SEL)) {
+        if (t.closest("#below")) continue; // under the video: handled by the wash
+        if (t.getClientRects().length) {
+          thread = t;
+          break;
+        }
+      }
+    }
+    if (!thread) {
+      if (panelRoot) clearCommentPanel();
+      return;
+    }
+    if (!panelRoot || !panelRoot.contains(thread)) {
+      // Page-wide containers are left alone (the page background is handled separately)
+      const maxW = window.innerWidth * 0.6;
+      let root = null;
+      for (let el = thread.parentElement; el && el !== flexy; el = el.parentElement) {
+        const r = el.getBoundingClientRect();
+        if (r.width >= maxW) break;
+        if (r.width >= 200 && hasFill(getComputedStyle(el).backgroundColor)) root = el;
+      }
+      if (!root) return;
+      clearCommentPanel();
+      panelRoot = root;
+      root.setAttribute("data-ambl-panel-root", "");
+    }
+    const minW = panelRoot.getBoundingClientRect().width * 0.6;
+    for (const el of panelRoot.querySelectorAll("*")) {
+      if (panelSeen.has(el)) continue;
+      panelSeen.add(el);
+      if (el.getBoundingClientRect().width < minW) continue;
+      if (hasFill(getComputedStyle(el).backgroundColor)) el.setAttribute("data-ambl-panel", "");
+    }
   }
 
   // ───────────────────────── Layout ─────────────────────────
