@@ -12,8 +12,9 @@ Tested with Safari 27 on macOS.
 - Smooth in Safari: the glow is part of the page, so it scrolls with it instead of trailing behind, and the video frames are processed on the GPU.
 - At the top of the page the glow shows through the header and the search bar. Hovering the search bar fades it back to normal.
 - Readability boost, so titles, buttons and descriptions stay readable on bright videos.
+- The light also falls on the comments below the video, and keeps following the video while you read them.
 - Theater mode, playlists, and optional black bar removal for letterboxed videos.
-- Pauses itself when the video is off-screen or the tab is in the background.
+- Pauses itself when the tab is in the background, or when neither the video nor the comments are on screen.
 - No network requests and nothing is collected. Settings are saved in your browser's local storage.
 
 ## Install (Safari on macOS)
@@ -45,6 +46,7 @@ Open any video. The sun icon in the player controls (or Shift+A) opens the setti
 - **Use dark theme**: switches YouTube to dark mode on video pages. The glow looks much better on black.
 - **Transparent header at the top, Glow through the search bar**: let the glow show behind the top bar.
 - **Readability boost**: text shadows and darker buttons. 0% turns it off.
+- **Glow on the comments**: how strongly the video's colors light up the comments. 0% turns it off.
 - **Remove black bars**: ignores letterboxing when picking colors.
 - **Frame rate limit, GPU acceleration (WebGL)**: leave WebGL on unless the glow doesn't show up at all.
 
