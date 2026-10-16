@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Ambient Light For Safari
 // @namespace    https://github.com/neul-lov/youtube-ambient-light-for-safari
-// @version      2.6.0
+// @version      2.7.0
 // @description  Ambient light (ambilight) for YouTube in Safari: the colors of the video glow around the player.
 // @author       neul-lov
 // @license      MIT
@@ -45,19 +45,54 @@
     headerTransparent: true, // transparent header while scrolled to the top
     searchClear: true, // let the glow show through the search bar (restored on hover)
     readability: 60, // text/icon halos, darker translucent boxes, dimmed header glow (0 = off)
+    commentsGlow: 40, // strength of the light cast onto the comments (0 = off)
     webgl: true,
+  };
+
+  // Valid range of every numeric setting (also used by the sliders)
+  const LIMITS = {
+    blur: [0, 100],
+    edge: [2, 50],
+    spread: [0, 400],
+    fadeStart: [-50, 100],
+    fadeCurve: [1, 100],
+    brightness: [0, 200],
+    contrast: [0, 200],
+    saturation: [0, 200],
+    smoothing: [0, 95],
+    fps: [10, 60],
+    readability: [0, 100],
+    commentsGlow: [0, 100],
   };
 
   let S = loadSettings();
 
+  // localStorage is shared with YouTube's own scripts, so stored values are not trusted:
+  // only known keys with the right type are taken, and numbers are clamped to their range
+  // (they end up in shaders, CSS filters and divisions).
+  function sanitize(raw) {
+    const out = Object.assign({}, DEFAULTS);
+    if (!raw || typeof raw !== "object") return out;
+    for (const k of Object.keys(DEFAULTS)) {
+      if (!Object.prototype.hasOwnProperty.call(raw, k)) continue;
+      const v = raw[k];
+      if (typeof DEFAULTS[k] === "boolean") {
+        if (typeof v === "boolean") out[k] = v;
+      } else if (typeof v === "number" && Number.isFinite(v)) {
+        out[k] = clamp(v, LIMITS[k][0], LIMITS[k][1]);
+      }
+    }
+    return out;
+  }
+
   function loadSettings() {
     try {
       const saved = localStorage.getItem(STORE_KEY);
-      if (saved) return Object.assign({}, DEFAULTS, JSON.parse(saved));
+      if (saved) return sanitize(JSON.parse(saved));
       // Migrate v2 settings but drop the old (narrow) spread value
       const old = JSON.parse(localStorage.getItem("ambl-settings-v2") || "{}");
-      delete old.spread;
-      return Object.assign({}, DEFAULTS, old);
+      if (old && typeof old === "object") delete old.spread;
+      return sanitize(old);
     } catch (e) {
       return Object.assign({}, DEFAULTS);
     }
@@ -188,6 +223,19 @@
     html.ambl-on ytd-watch-flexy ytd-live-chat-frame {
       background: none !important;
     }
+    /* Comments in a side panel (newer layout): the script marks the panel's opaque layers,
+       so the glow beside the player shines into it. Comments under the video get the wash. */
+    html.ambl-on [data-ambl-panel-root] {
+      background: var(--ambl-box) !important;
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+    }
+    html.ambl-on [data-ambl-panel] {
+      background-color: transparent !important;
+      background-image: none !important;
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+    }
 
     /* Text: a dark halo. text-shadow is inherited, so it is set on large containers, plus on
        buttons and inputs where the browser's default style turns it off */
@@ -283,6 +331,17 @@
   let viewObs = null;
   let inView = true;
   let forcedDark = false;
+
+  // Comments glow: a tiny canvas stretched over the comments section, colored from the video
+  const WASH_W = 16; // color samples across the video
+  const WASH_ROWS = 4; // sample rows (the bottom of the video counts most)
+  const WASH_MS = 100; // color update interval (needs a GPU readback, so not every frame)
+  let wash = null; // { canvas, ctx, img, rows, target }
+  let washObs = null;
+  let washInView = false;
+  let washSnap = true;
+  let lastWash = 0;
+  const washCol = new Float32Array(WASH_W * 3);
 
   const VIDEO_EVENTS = {
     play: () => restartLoop(),
@@ -410,11 +469,13 @@
     let proj = null;
     let tmp = null;
     let det = null;
+    let washT = null;
     let floatOK = false;
     let srcFloat = false;
     let sw = 0, sh = 0, mw = 0, mh = 0, bw = 0, bh = 0;
     let lost = false;
     const detBuf = new Uint8Array(DET_W * DET_H * 4);
+    const washBuf = new Uint8Array(WASH_W * WASH_ROWS * 4);
 
     function makeTex() {
       const t = gl.createTexture();
@@ -490,6 +551,7 @@
       // Half-float buffer: small blend steps do not get stuck short of the target color
       floatOK = isGL2 && !!(gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float"));
       det = makeTarget(DET_W, DET_H, false);
+      washT = makeTarget(WASH_W, WASH_ROWS, false);
       mid = src = proj = tmp = null;
       sw = sh = mw = mh = bw = bh = 0;
     }
@@ -588,6 +650,18 @@
         return { data: detBuf, flipY: true };
       },
 
+      // Average colors of the (cropped, smoothed) video in a WASH_W x WASH_ROWS grid
+      sampleWash() {
+        if (lost || !washT || !src) return null;
+        run(progs.sample, washT, WASH_W, WASH_ROWS, src.tex, {
+          src: [0, 0, 1, 1],
+          tap: [1 / WASH_W / 4, 1 / WASH_ROWS / 4],
+          flip: 0,
+        });
+        gl.readPixels(0, 0, WASH_W, WASH_ROWS, gl.RGBA, gl.UNSIGNED_BYTE, washBuf);
+        return { data: washBuf, flipY: true };
+      },
+
       accumulate(a) {
         const c = [crop.l, crop.t, 1 - crop.l - crop.r, 1 - crop.t - crop.b];
         let tex = vtex;
@@ -649,6 +723,10 @@
     dc.width = DET_W;
     dc.height = DET_H;
     const dctx = dc.getContext("2d", { willReadFrequently: true });
+    const wc = document.createElement("canvas");
+    wc.width = WASH_W;
+    wc.height = WASH_ROWS;
+    const wctx = wc.getContext("2d", { willReadFrequently: true });
 
     return {
       kind: "Canvas2D",
@@ -670,6 +748,17 @@
         try {
           dctx.drawImage(video, 0, 0, DET_W, DET_H);
           return { data: dctx.getImageData(0, 0, DET_W, DET_H).data, flipY: false };
+        } catch (e) {
+          return null;
+        }
+      },
+
+      // The canvas holds the cropped (and blended) video, so it is the source here
+      sampleWash() {
+        if (!canvas.width) return null;
+        try {
+          wctx.drawImage(canvas, 0, 0, WASH_W, WASH_ROWS);
+          return { data: wctx.getImageData(0, 0, WASH_W, WASH_ROWS).data, flipY: false };
         } catch (e) {
           return null;
         }
@@ -768,6 +857,7 @@
     applyReadability();
     if (S.headerTransparent) markHeader();
     if (S.searchClear) markSearchbox();
+    markCommentPanel();
     applyTheme();
     updateAtTop();
 
@@ -791,6 +881,7 @@
       resizeObs = new ResizeObserver(() => layout());
       resizeObs.observe(video);
     }
+    if (wash) wash.target = null; // observed again by the new ResizeObserver in layoutWash()
 
     // Stop rendering entirely while the video is far off-screen (e.g. reading comments)
     if (viewObs) viewObs.disconnect();
@@ -801,7 +892,11 @@
           const visible = entries[entries.length - 1].isIntersecting;
           if (visible === inView) return;
           inView = visible;
-          if (inView) restartLoop();
+          if (!inView) return;
+          // The glow is not redrawn while off-screen, so catch up right away (a paused video
+          // delivers no new frames)
+          if (video && video.paused) drawNow();
+          restartLoop();
         },
         { rootMargin: "300px" }
       );
@@ -847,8 +942,9 @@
   }
 
   function deactivate() {
-    if (!video && !renderer && !root.classList.contains("ambl-on")) return;
+    if (!video && !renderer && !wash && !root.classList.contains("ambl-on")) return;
     unbindVideo();
+    removeWash();
     if (resizeObs) resizeObs.disconnect();
     resizeObs = null;
     if (viewObs) viewObs.disconnect();
@@ -866,6 +962,7 @@
     player = null;
     root.classList.remove("ambl-on", "ambl-header-clear", "ambl-search-clear", "ambl-top");
     clearReadability();
+    clearCommentPanel();
     restoreTheme();
     updateStatus();
   }
@@ -965,6 +1062,236 @@
     }
   }
 
+  // ───────────────────────── Comments glow ─────────────────────────
+  // The comments get a soft wash of the video's colors (weighted toward its bottom edge, where the
+  // light "falls" from). Like the main glow it lives in #ambl-root in document coordinates, so it
+  // scrolls with the page without any JavaScript. The canvas is WASH_W x (rows) pixels, stretched
+  // with a CSS transform; bilinear scaling turns it into smooth gradients.
+  const smooth = (t) => {
+    t = clamp(t, 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+  const washTmp = new Float32Array(WASH_W * 3);
+
+  function findComments() {
+    const el = document.querySelector("ytd-watch-flexy:not([hidden]) ytd-comments#comments");
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return r.width >= 50 && r.height >= 20 ? { el, r } : null;
+  }
+
+  function washVisible() {
+    return !!wash && washInView;
+  }
+
+  function unobserveWashTarget() {
+    if (!wash || !wash.target || !resizeObs) return;
+    resizeObs.unobserve(wash.target);
+    if (wash.target.parentElement) resizeObs.unobserve(wash.target.parentElement);
+  }
+
+  function removeWash() {
+    if (!wash) return;
+    unobserveWashTarget();
+    if (washObs) washObs.disconnect();
+    washObs = null;
+    wash.canvas.remove();
+    wash = null;
+    washInView = false;
+  }
+
+  function layoutWash() {
+    const c = S.commentsGlow > 0 && box ? findComments() : null;
+    if (!c) {
+      removeWash();
+      return;
+    }
+    if (!wash) {
+      const canvas = document.createElement("canvas");
+      canvas.width = WASH_W;
+      canvas.height = 1;
+      wash = { canvas, ctx: canvas.getContext("2d"), img: null, rows: 0, ax: null, ay: null, target: null, key: "", has: false };
+      washSnap = true;
+      if (window.IntersectionObserver) {
+        // Keep sampling the video while the comments are on screen, even with the video scrolled away
+        washObs = new IntersectionObserver((entries) => {
+          const visible = entries[entries.length - 1].isIntersecting;
+          if (visible === washInView) return;
+          washInView = visible;
+          if (!visible) return;
+          washSnap = true;
+          drawNow();
+          if (!running) restartLoop();
+        });
+        washObs.observe(canvas);
+      } else {
+        washInView = true;
+      }
+    }
+    // Below the main glow canvas, so the glow around the player stays on top
+    if (wash.canvas.parentElement !== box || box.firstChild !== wash.canvas) box.insertBefore(wash.canvas, box.firstChild);
+
+    // Follow the comments' size (more loaded) and position (description expanded etc.)
+    if (wash.target !== c.el) {
+      unobserveWashTarget();
+      wash.target = c.el;
+      if (resizeObs) {
+        resizeObs.observe(c.el);
+        if (c.el.parentElement) resizeObs.observe(c.el.parentElement);
+      }
+    }
+
+    const r = c.r;
+    const side = r.width * 0.08;
+    const lead = Math.min(320, window.innerHeight * 0.4); // fade-in above the comments
+    const tail = 160; // fade-out below them
+    const x = r.left + window.scrollX - side;
+    const y = r.top + window.scrollY - lead;
+    const w = r.width + 2 * side;
+    const h = r.height + lead + tail;
+    const rows = Math.round(clamp(h / 80, 8, 256));
+    const key = [x, y, w, h, S.commentsGlow].map((n) => n.toFixed(1)).join(",");
+    if (key === wash.key) return;
+    wash.key = key;
+
+    if (rows !== wash.rows) {
+      wash.rows = rows;
+      wash.canvas.height = rows;
+      wash.img = wash.ctx.createImageData(WASH_W, rows);
+    }
+    wash.ax = new Float32Array(WASH_W);
+    for (let i = 0; i < WASH_W; i++) {
+      const u = (i + 0.5) / WASH_W;
+      wash.ax[i] = smooth(u / 0.18) * smooth((1 - u) / 0.18);
+    }
+    wash.ay = new Float32Array(rows);
+    for (let j = 0; j < rows; j++) {
+      const yy = ((j + 0.5) / rows) * h;
+      wash.ay[j] = smooth(yy / (2 * lead)) * smooth((h - yy) / tail);
+    }
+
+    const cs = wash.canvas.style;
+    cs.width = WASH_W + "px";
+    cs.height = rows + "px";
+    cs.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) scale(${(w / WASH_W).toFixed(4)}, ${(h / rows).toFixed(4)})`;
+    paintWash();
+  }
+
+  function paintWash() {
+    if (!wash || !wash.img) return;
+    const strength = wash.has ? (S.commentsGlow / 100) * 0.8 : 0;
+    const d = wash.img.data;
+    for (let j = 0; j < wash.rows; j++) {
+      for (let i = 0; i < WASH_W; i++) {
+        const p = (j * WASH_W + i) * 4;
+        d[p] = washCol[i * 3] * 255;
+        d[p + 1] = washCol[i * 3 + 1] * 255;
+        d[p + 2] = washCol[i * 3 + 2] * 255;
+        d[p + 3] = 255 * strength * wash.ax[i] * wash.ay[j];
+      }
+    }
+    wash.ctx.putImageData(wash.img, 0, 0);
+  }
+
+  function updateWash() {
+    const s = renderer.sampleWash();
+    if (!s) return;
+    const d = s.data;
+    const bri = S.brightness / 100;
+    const con = S.contrast / 100;
+    const sat = S.saturation / 100;
+    for (let i = 0; i < WASH_W; i++) {
+      let r = 0, g = 0, b = 0, ws = 0;
+      for (let y = 0; y < WASH_ROWS; y++) {
+        const row = s.flipY ? WASH_ROWS - 1 - y : y; // y = 0 is the top of the video
+        const p = (row * WASH_W + i) * 4;
+        const wt = y + 1;
+        r += d[p] * wt;
+        g += d[p + 1] * wt;
+        b += d[p + 2] * wt;
+        ws += wt;
+      }
+      // Same color adjustments as the glow shader
+      const adj = (v) => ((v / ws / 255 - 0.5) * con + 0.5) * bri;
+      r = adj(r);
+      g = adj(g);
+      b = adj(b);
+      const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      washTmp[i * 3] = clamp(l + (r - l) * sat, 0, 1);
+      washTmp[i * 3 + 1] = clamp(l + (g - l) * sat, 0, 1);
+      washTmp[i * 3 + 2] = clamp(l + (b - l) * sat, 0, 1);
+    }
+    // Soften the steps between neighboring columns, then ease toward the new colors
+    const k = washSnap || needFull || !wash.has ? 1 : 0.35; // jump on seeks and new videos
+    for (let i = 0; i < WASH_W; i++) {
+      const a = Math.max(i - 1, 0) * 3;
+      const c = Math.min(i + 1, WASH_W - 1) * 3;
+      for (let ch = 0; ch < 3; ch++) {
+        const v = (washTmp[a + ch] + 2 * washTmp[i * 3 + ch] + washTmp[c + ch]) / 4;
+        washCol[i * 3 + ch] += (v - washCol[i * 3 + ch]) * k;
+      }
+    }
+    washSnap = false;
+    wash.has = true;
+    paintWash();
+  }
+
+  // Comments in a side panel: its markup differs between YouTube layouts, so instead of class
+  // names the script looks for the outermost opaque layer around a visible comment and marks it
+  // (translucent box) plus the wide opaque layers inside it (transparent). Each element is
+  // checked once; comments loaded later are picked up on the next round.
+  const THREAD_SEL = "ytd-comment-thread-renderer, ytd-comment-view-model, yt-comment-view-model";
+  let panelRoot = null;
+  let panelSeen = new WeakSet();
+
+  function clearCommentPanel() {
+    for (const el of document.querySelectorAll("[data-ambl-panel], [data-ambl-panel-root]")) {
+      el.removeAttribute("data-ambl-panel");
+      el.removeAttribute("data-ambl-panel-root");
+    }
+    panelRoot = null;
+    panelSeen = new WeakSet();
+  }
+
+  function markCommentPanel() {
+    const flexy = S.commentsGlow > 0 ? document.querySelector("ytd-watch-flexy:not([hidden])") : null;
+    let thread = null;
+    if (flexy) {
+      for (const t of flexy.querySelectorAll(THREAD_SEL)) {
+        if (t.closest("#below")) continue; // under the video: handled by the wash
+        if (t.getClientRects().length) {
+          thread = t;
+          break;
+        }
+      }
+    }
+    if (!thread) {
+      if (panelRoot) clearCommentPanel();
+      return;
+    }
+    if (!panelRoot || !panelRoot.contains(thread)) {
+      // Page-wide containers are left alone (the page background is handled separately)
+      const maxW = window.innerWidth * 0.6;
+      let root = null;
+      for (let el = thread.parentElement; el && el !== flexy; el = el.parentElement) {
+        const r = el.getBoundingClientRect();
+        if (r.width >= maxW) break;
+        if (r.width >= 200 && hasFill(getComputedStyle(el).backgroundColor)) root = el;
+      }
+      if (!root) return;
+      clearCommentPanel();
+      panelRoot = root;
+      root.setAttribute("data-ambl-panel-root", "");
+    }
+    const minW = panelRoot.getBoundingClientRect().width * 0.6;
+    for (const el of panelRoot.querySelectorAll("*")) {
+      if (panelSeen.has(el)) continue;
+      panelSeen.add(el);
+      if (el.getBoundingClientRect().width < minW) continue;
+      if (hasFill(getComputedStyle(el).backgroundColor)) el.setAttribute("data-ambl-panel", "");
+    }
+  }
+
   // ───────────────────────── Layout ─────────────────────────
   function clamp(v, lo, hi) {
     return Math.min(hi, Math.max(lo, v));
@@ -987,6 +1314,7 @@
       bs.width = "calc(100% + " + offX + "px)";
       bs.height = "calc(100% + " + offY + "px)";
     }
+    layoutWash();
 
     // Visible picture area without detected black bars (document coordinates, scroll-independent)
     const x = vr.left + window.scrollX + vr.width * crop.l;
@@ -1083,13 +1411,14 @@
   function tick(now) {
     frameReq = 0;
     if (!running) return;
-    // Stop the loop while off-screen or hidden (it restarts when visible again)
-    if (!inView || document.hidden) {
+    // Stop the loop while nothing that uses it is on screen (it restarts when visible again)
+    if (document.hidden || (!inView && !washVisible())) {
       running = false;
       return;
     }
-    // If drawing gets expensive, back off so the main thread stays under ~10% usage
-    const interval = Math.max(1000 / S.fps, costAvg * 10);
+    // If drawing gets expensive, back off so the main thread stays under ~10% usage.
+    // With only the comments on screen, the colors are updated at the slower wash rate.
+    const interval = Math.max(inView ? 1000 / S.fps : WASH_MS, costAvg * 10);
     if (now - lastDraw >= interval - 2) drawFrame(now);
     schedule();
   }
@@ -1126,7 +1455,12 @@
       const dt = Math.min(250, Math.max(1, now - lastDraw));
       const keep = needFull || !S.smoothing ? 0 : Math.pow(Math.min(0.95, S.smoothing / 100), dt / 33.3);
       renderer.accumulate(1 - keep);
-      renderer.post();
+      // The glow around the player is skipped while it is off-screen (only the comments need colors)
+      if (inView) renderer.post();
+      if (washVisible() && (needFull || now - lastWash >= WASH_MS)) {
+        lastWash = now;
+        updateWash();
+      }
 
       needFull = false;
       lastDraw = now;
@@ -1205,6 +1539,7 @@
       headerTransparent: "Transparent header at the top",
       searchClear: "Glow through the search bar",
       readability: "Readability boost",
+      commentsGlow: "Glow on the comments",
       barDetection: "Remove black bars",
       secPerf: "PERFORMANCE",
       fps: "Frame rate limit",
@@ -1233,6 +1568,7 @@
       headerTransparent: "맨 위에서 헤더 투명하게",
       searchClear: "검색창에도 빛 비치기",
       readability: "가독성 보정",
+      commentsGlow: "댓글창에도 빛 비치기",
       barDetection: "검은 띠 제거",
       secPerf: "성능",
       fps: "프레임 제한",
@@ -1309,8 +1645,8 @@
     return e;
   }
 
-  function onChange() {
-    saveSettings();
+  function onChange(save = true) {
+    if (save) saveSettings();
     ensure();
     lastRect = "";
     layout();
@@ -1320,7 +1656,8 @@
     parent.appendChild(el("div", "ambl-section", label));
   }
 
-  function addSlider(parent, key, label, min, max, step, unit) {
+  function addSlider(parent, key, label, step, unit) {
+    const [min, max] = LIMITS[key];
     const row = el("div", "ambl-row");
     const lab = el("div", "ambl-label");
     const fmt = (v) => v + (unit || "");
@@ -1374,29 +1711,30 @@
     addCheck(panel, "enabled", tr("enabled"));
 
     addSection(panel, tr("secLight"));
-    addSlider(panel, "blur", tr("blur"), 0, 100, 1, "%");
-    addSlider(panel, "edge", tr("edge"), 2, 50, 1, "%");
-    addSlider(panel, "spread", tr("spread"), 0, 400, 1, "%");
-    addSlider(panel, "fadeStart", tr("fadeStart"), -50, 100, 1, "%");
-    addSlider(panel, "fadeCurve", tr("fadeCurve"), 1, 100, 1, "%");
-    addSlider(panel, "smoothing", tr("smoothing"), 0, 95, 5, "%");
+    addSlider(panel, "blur", tr("blur"), 1, "%");
+    addSlider(panel, "edge", tr("edge"), 1, "%");
+    addSlider(panel, "spread", tr("spread"), 1, "%");
+    addSlider(panel, "fadeStart", tr("fadeStart"), 1, "%");
+    addSlider(panel, "fadeCurve", tr("fadeCurve"), 1, "%");
+    addSlider(panel, "smoothing", tr("smoothing"), 5, "%");
 
     addSection(panel, tr("secFilters"));
-    addSlider(panel, "brightness", tr("brightness"), 0, 200, 1, "%");
-    addSlider(panel, "contrast", tr("contrast"), 0, 200, 1, "%");
-    addSlider(panel, "saturation", tr("saturation"), 0, 200, 1, "%");
+    addSlider(panel, "brightness", tr("brightness"), 1, "%");
+    addSlider(panel, "contrast", tr("contrast"), 1, "%");
+    addSlider(panel, "saturation", tr("saturation"), 1, "%");
 
     addSection(panel, tr("secPage"));
     addCheck(panel, "forceDark", tr("forceDark"));
     addCheck(panel, "headerTransparent", tr("headerTransparent"));
     addCheck(panel, "searchClear", tr("searchClear"));
-    addSlider(panel, "readability", tr("readability"), 0, 100, 5, "%");
+    addSlider(panel, "readability", tr("readability"), 5, "%");
+    addSlider(panel, "commentsGlow", tr("commentsGlow"), 5, "%");
     addCheck(panel, "barDetection", tr("barDetection"), () => {
       if (!S.barDetection) resetCrop();
     });
 
     addSection(panel, tr("secPerf"));
-    addSlider(panel, "fps", tr("fps"), 10, 60, 5, " fps");
+    addSlider(panel, "fps", tr("fps"), 5, " fps");
     addCheck(panel, "webgl", tr("webgl"), () => setTimeout(rebuildRenderer));
 
     const reset = el("button", "ambl-reset", tr("reset"));
@@ -1427,7 +1765,7 @@
     "keydown",
     (e) => {
       if (e.code !== "KeyA" || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
-      const t = e.target;
+      const t = (e.composedPath && e.composedPath()[0]) || e.target;
       if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
       if (!isWatchPage()) return;
       // A: toggle the glow, Shift+A: open/close the settings panel
@@ -1470,7 +1808,7 @@
     S = loadSettings();
     Object.values(inputs).forEach((i) => i.sync());
     if (prevGL !== S.webgl) rebuildRenderer();
-    onChange();
+    onChange(false);
   });
 
   setInterval(ensure, 1000);
