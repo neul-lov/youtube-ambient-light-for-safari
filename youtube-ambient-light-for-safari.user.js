@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Ambient Light For Safari
 // @namespace    https://github.com/neul-lov/youtube-ambient-light-for-safari
-// @version      3.0.0
+// @version      3.0.1
 // @description  Ambient light (ambilight) for YouTube in Safari: the colors of the video glow around the player.
 // @author       neul-lov
 // @license      MIT
@@ -376,6 +376,10 @@
     emptied: () => {
       needFull = true;
       resetCrop();
+    },
+    // A paused video gets no frame callbacks, so a first frame that was skipped is drawn here
+    canplay: () => {
+      if (box && !box.classList.contains("ambl-ready")) drawNow();
     },
     resize: () => layout(),
   };
@@ -814,7 +818,8 @@
   // ───────────────────────── Renderer: WebGPU ─────────────────────────
   // The same passes as the WebGL renderer, with three differences:
   // - The video frame is sampled straight from the decoder's output (importExternalTexture), so a
-  //   full-size copy of every frame is never made.
+  //   full-size copy of every frame is not needed. Videos that Safari can't hand over that way are
+  //   detected and copied instead (see "Reading the video frame" below).
   // - Readbacks (black bars, comments glow) are asynchronous and never stall the GPU. Their result
   //   is one update behind, which nothing here notices.
   // - The result goes into one of two stacked canvases, and each update fades in over the previous
@@ -921,9 +926,10 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       console.warn("[Ambient Light] WebGPU stopped working; switching renderers.", why);
       setTimeout(rebuildRenderer);
     };
-    // Also resolves when the device is destroyed on purpose (renderer rebuilt), which is not a loss
+    // Also resolves when the device is destroyed on purpose (renderer rebuilt), which is not a loss.
+    // Only the local flag tells the two apart: Safari may report a real loss as "destroyed" too.
     device.lost.then((info) => {
-      if (destroyed || (info && info.reason === "destroyed")) return;
+      if (destroyed) return;
       gpuLosses++;
       fail(info && info.message);
     });
@@ -962,7 +968,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       ext8: pipe(mExt, "rgba8unorm"), // video → downscale buffer / bar detection
       extSrc: pipe(mExt, "rgba16float", BLEND), // video → blended buffer
       midSrc: pipe(mTex, "rgba16float", BLEND), // downscale buffer → blended buffer
-      wash: pipe(mTex, "rgba8unorm"), // blended buffer → comments glow colors
+      tex8: pipe(mTex, "rgba8unorm"), // texture → 8-bit buffer (comments glow colors, copied frames)
       project: pipe(mod(WGSL_PROJECT), "rgba8unorm"),
       blur: pipe(mod(wgslBlur(false)), "rgba8unorm"),
       final: pipe(mod(wgslBlur(true)), format),
@@ -976,7 +982,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
 
     const smp = device.createSampler({ magFilter: "linear", minFilter: "linear" });
     const ubuf = (size) => device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    const U = { mid: ubuf(32), src: ubuf(32), det: ubuf(32), wash: ubuf(32), project: ubuf(64), blur: ubuf(48), final: ubuf(48) };
+    const U = { mid: ubuf(32), src: ubuf(32), det: ubuf(32), chk: ubuf(32), wash: ubuf(32), project: ubuf(64), blur: ubuf(48), final: ubuf(48) };
     const put = (b, values) => device.queue.writeBuffer(b, 0, new Float32Array(values));
     const target = (w, h, fmt = "rgba8unorm", usage = 0) =>
       device.createTexture({ size: [w, h], format: fmt, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | usage });
@@ -1045,6 +1051,98 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       pending = null;
     };
 
+    // ── Reading the video frame ──
+    // importExternalTexture samples the decoder's output directly, but in Safari some videos come
+    // out all black that way, without any error (it depends on how the video is decoded). So each
+    // video is checked: a small downscale through the external texture is compared with three
+    // small regions copied with copyExternalImageToTexture, which converts the frame the way WebGL
+    // does. Until the external texture is known to show the current video, and for videos where it
+    // doesn't, the whole frame is copied instead (correct, but a full-size copy per update).
+    const CHK_W = 32, CHK_H = 18, PROBE_W = 64, PROBE_H = 36;
+    const chk = target(CHK_W, CHK_H, "rgba8unorm", GPUTextureUsage.COPY_SRC);
+    const probe = device.createTexture({
+      size: [PROBE_W, PROBE_H * 3],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    let frame = null; // full-size copy of the video frame (copy mode)
+    let videoKey = ""; // source and size of the video the checks below refer to
+    let extOK = false; // the external texture shows the current video
+    let extBroken = false; // it doesn't (until the video changes)
+    let checking = false;
+    let lastCheck = 0;
+    let copyMode = false; // this update reads `frame` instead of `ext`
+    let brokenVotes = 0; // consecutive checks where the external texture was black but the copy was not
+    let failingSince = 0; // when frames started failing to load (0 while they load)
+
+    // Brightest channel value in a texture, read back asynchronously
+    const readMax = (tex, w, h, enc) => {
+      const bytesPerRow = Math.ceil((w * 4) / 256) * 256;
+      const buf = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      enc.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow }, [w, h]);
+      return () =>
+        buf.mapAsync(GPUMapMode.READ).then(() => {
+          const d = new Uint8Array(buf.getMappedRange());
+          let mx = 0;
+          for (let y = 0; y < h; y++) {
+            for (let i = y * bytesPerRow, end = i + w * 4; i < end; i += 4) mx = Math.max(mx, d[i], d[i + 1], d[i + 2]);
+          }
+          buf.unmap();
+          buf.destroy();
+          return mx;
+        });
+    };
+
+    const checkExternal = (v) => {
+      checking = true;
+      lastCheck = performance.now();
+      const key = videoKey;
+      try {
+        const vw = v.videoWidth, vh = v.videoHeight;
+        const w = Math.min(PROBE_W, vw), h = Math.min(PROBE_H, vh);
+        const enc = encoder();
+        put(U.chk, [0, 0, 1, 1, 1 / CHK_W / 4, 1 / CHK_H / 4, 0, 0]);
+        pass(enc, chk.createView(), P.ext8, group(P.ext8, ext, U.chk));
+        // Three regions along the diagonal, which stay clear of letterboxing bars
+        for (let k = 0; k < 3; k++) {
+          const origin = [Math.floor(((vw - w) * (k + 1)) / 4), Math.floor(((vh - h) * (k + 1)) / 4)];
+          device.queue.copyExternalImageToTexture({ source: v, origin }, { texture: probe, origin: [0, k * PROBE_H] }, [w, h]);
+        }
+        const extMax = readMax(chk, CHK_W, CHK_H, enc);
+        const copyMax = readMax(probe, PROBE_W, PROBE_H * 3, enc);
+        flush();
+        Promise.all([extMax(), copyMax()]).then(
+          ([e, c]) => {
+            checking = false;
+            if (destroyed || key !== videoKey) return;
+            if (e > 4) {
+              extOK = true;
+              brokenVotes = 0;
+            } else if (c > 24) {
+              // Copy until it is settled; a second check on another frame decides (a dark frame with a
+              // few bright pixels can fool one check)
+              extOK = false;
+              if (++brokenVotes >= 2) {
+                extBroken = true;
+                console.info("[Ambient Light] WebGPU can't read this video directly; copying its frames instead.");
+              }
+            }
+            // Both dark: probably a dark scene, so check again on a later update
+          },
+          () => (checking = false)
+        );
+      } catch (e) {
+        // Try again on a later update; meanwhile the copied frame keeps the glow right
+        checking = false;
+      }
+    };
+
+    // A pass from the current video frame (external texture or copied frame) into `view`
+    const fromVideo = (view, toSrc, buf, blend) => {
+      const pipeline = copyMode ? (toSrc ? P.midSrc : P.tex8) : toSrc ? P.extSrc : P.ext8;
+      pass(encoder(), view, pipeline, group(pipeline, copyMode ? frame.createView() : ext, buf), blend);
+    };
+
     return {
       kind: "WebGPU",
       canvas: wrap,
@@ -1059,7 +1157,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
           if (src) src.destroy();
           src = target(sw, sh, "rgba16float");
           gProject = group(P.project, src.createView(), U.project);
-          gWash = group(P.wash, src.createView(), U.wash);
+          gWash = group(P.tex8, src.createView(), U.wash);
           resized = true;
         }
         if (g.mw !== mw || g.mh !== mh) {
@@ -1090,21 +1188,61 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
 
       upload(v) {
         ext = null;
+        copyMode = false;
         if (lost || !src) return false;
+        const vw = v.videoWidth, vh = v.videoHeight;
+        const key = v.currentSrc + "|" + vw + "x" + vh;
+        if (key !== videoKey) {
+          // A new video, or a new resolution (which can come from another decoder): check again
+          videoKey = key;
+          extOK = extBroken = false;
+          brokenVotes = 0;
+          lastCheck = 0;
+          failingSince = 0;
+        }
         try {
-          ext = device.importExternalTexture({ source: v });
+          if (!extBroken) {
+            ext = device.importExternalTexture({ source: v });
+            // Until it works check twice a second; once it works, every 10 s (the decoder can change
+            // without the size changing)
+            const since = performance.now() - lastCheck;
+            if (!checking && (extOK ? since > 10000 : since > 500)) checkExternal(v);
+          }
+          if (!extOK) {
+            if (!frame || frame.width !== vw || frame.height !== vh) {
+              if (frame) frame.destroy();
+              frame = device.createTexture({
+                size: [vw, vh],
+                format: "rgba8unorm",
+                usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+              });
+            }
+            device.queue.copyExternalImageToTexture({ source: v }, { texture: frame }, [vw, vh]);
+            copyMode = true;
+          } else if (frame) {
+            frame.destroy();
+            frame = null;
+          }
         } catch (e) {
+          // If frames keep failing to load for 2 s (not just a hiccup), let WebGL take over
+          const now = performance.now();
+          if (!failingSince) failingSince = now;
+          else if (now - failingSince > 2000 && !v.seeking) {
+            gpuDisabled = true;
+            fail(e && e.message);
+          }
           return false;
         }
+        failingSince = 0;
         return true;
       },
 
       // All of an update's work goes into one command encoder, submitted once (fewer messages to
       // Safari's GPU process); readbacks submit early because they map their buffer afterwards
       detect() {
-        if (lost || !ext) return null;
+        if (lost || (!ext && !copyMode)) return null;
         put(U.det, [0, 0, 1, 1, 1 / DET_W / 4, 1 / DET_H / 4, 0, 0]);
-        pass(encoder(), det.createView(), P.ext8, group(P.ext8, ext, U.det));
+        fromVideo(det.createView(), false, U.det);
         const copied = detRB.copy(encoder());
         flush();
         if (copied) detRB.map();
@@ -1114,7 +1252,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       sampleWash() {
         if (lost || !src) return null;
         put(U.wash, [0, 0, 1, 1, 1 / WASH_W / 4, 1 / WASH_ROWS / 4, 0, 0]);
-        pass(encoder(), washT.createView(), P.wash, gWash);
+        pass(encoder(), washT.createView(), P.tex8, gWash);
         const copied = washRB.copy(encoder());
         flush();
         if (copied) washRB.map();
@@ -1122,16 +1260,16 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       },
 
       accumulate(a) {
-        if (lost || !ext || !src) return;
+        if (lost || !src || (!ext && !copyMode)) return;
         const c = [crop.l, crop.t, 1 - crop.l - crop.r, 1 - crop.t - crop.b];
         if (mid) {
           put(U.mid, [...c, c[2] / mw / 4, c[3] / mh / 4, 0, 0]);
-          pass(encoder(), mid.createView(), P.ext8, group(P.ext8, ext, U.mid));
+          fromVideo(mid.createView(), false, U.mid);
           put(U.src, [0, 0, 1, 1, 1 / sw / 4, 1 / sh / 4, 0, 0]);
           pass(encoder(), src.createView(), P.midSrc, gMid, a);
         } else {
           put(U.src, [...c, c[2] / sw / 4, c[3] / sh / 4, 0, 0]);
-          pass(encoder(), src.createView(), P.extSrc, group(P.extSrc, ext, U.src), a);
+          fromVideo(src.createView(), true, U.src, a);
         }
       },
 
@@ -1150,12 +1288,15 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
         // frame goes into the canvas that is hidden right now (the bottom one while the top one is
         // showing, else the top one), then the top one fades out or in to reveal it. Changing the
         // z-order instead would make Safari update the whole page's layers on every update.
-        const fade = S.crossfade && !fresh;
-        const next = fade ? (topShown ? 0 : 1) : topShown ? 1 : 0;
+        // A paused video gets no later update that would reveal a hidden canvas, so it doesn't fade:
+        // with crossfade on, both canvases get the frame; with it off, only the visible one
+        const fade = S.crossfade && !fresh && !!video && !video.paused;
+        const visible = topShown ? 1 : 0;
+        const targets = fresh || (S.crossfade && !fade) ? [0, 1] : fade ? [1 - visible] : [visible];
         const enc = encoder();
         pass(enc, proj.createView(), P.project, gProject);
         pass(enc, tmp.createView(), P.blur, gBlur);
-        for (const n of fresh ? [0, 1] : [next]) pass(enc, ctx[n].getCurrentTexture().createView(), P.final, gFinal);
+        for (const n of targets) pass(enc, ctx[n].getCurrentTexture().createView(), P.final, gFinal);
         flush();
         fresh = false;
 
@@ -1174,6 +1315,9 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
 
       flush,
 
+      // Whether the current video is read by copying its frames (shown in the settings panel)
+      copying: () => extBroken,
+
       destroy() {
         destroyed = true;
         wrap.remove();
@@ -1183,13 +1327,23 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
   }
 
   // WebGPU → WebGL → Canvas2D. WebGPU needs an async setup, so renderers are created asynchronously.
-  async function createRenderer() {
+  async function createRenderer(gen) {
     if (S.webgl && S.webgpu && !gpuDisabled && gpuLosses < 2 && navigator.gpu) {
+      const setup = createGPURenderer();
+      let timer = 0;
       try {
-        const r = await createGPURenderer();
+        // A setup that never finishes would leave the page without a glow
+        const timeout = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("WebGPU setup timed out")), 3000);
+        });
+        const r = await Promise.race([setup, timeout]);
+        clearTimeout(timer);
         if (r) return r;
       } catch (e) {
-        gpuDisabled = true;
+        clearTimeout(timer);
+        // A stale setup (already replaced by a newer one) must not turn WebGPU off for the new one
+        if (gen === rendererGen) gpuDisabled = true;
+        setup.then((late) => late && late.destroy(), () => {}); // finished after the timeout: not used
         console.warn("[Ambient Light] WebGPU is unavailable, falling back to WebGL.", e);
       }
     }
@@ -1210,21 +1364,26 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
   function startRenderer() {
     if (renderer || pendingGen || !box) return;
     const gen = (pendingGen = ++rendererGen);
-    createRenderer().then((r) => {
+    createRenderer(gen).then((r) => {
       if (pendingGen === gen) pendingGen = 0;
       if (gen !== rendererGen || !box) {
         r.destroy();
         return;
       }
       renderer = r;
-      placeGlow();
-      updateStatus();
-      needFull = true;
-      geo = null;
-      lastRect = "";
-      layout();
-      drawNow();
-      restartLoop();
+      try {
+        placeGlow();
+        updateStatus();
+        needFull = true;
+        geo = null;
+        lastRect = "";
+        layout();
+        drawNow();
+      } catch (e) {
+        rendererFailed(e);
+      } finally {
+        restartLoop();
+      }
     }, (e) => {
       if (pendingGen === gen) pendingGen = 0;
       console.warn("[Ambient Light] Could not create a renderer.", e);
@@ -1298,6 +1457,13 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
 
     // Also re-check the position, in case the player moved without resizing (banners etc.)
     layout();
+
+    // Recover a missing renderer, and keep trying the first frame (a paused video sends no frames)
+    if (box && box.isConnected && !renderer && !pendingGen) startRenderer();
+    if (renderer && box && !box.classList.contains("ambl-ready") && video.readyState >= 2) {
+      needFull = true;
+      drawNow();
+    }
 
     // Watchdog for requestVideoFrameCallback occasionally stalling (e.g. Safari tab switches)
     if (!video.paused && !document.hidden && inView && performance.now() - lastDraw > 1500) restartLoop();
@@ -1896,8 +2062,12 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
     // If drawing gets expensive, back off so the main thread stays under ~10% usage.
     // With only the comments on screen, the colors are updated at the slower wash rate.
     const interval = Math.max(inView ? 1000 / S.fps : WASH_MS, costAvg * 10);
-    if (now - lastDraw >= interval - 2) drawFrame(now);
-    scheduleAfter(interval - (performance.now() - lastDraw) - 20);
+    try {
+      if (now - lastDraw >= interval - 2) drawFrame(now);
+    } finally {
+      // Re-arm even if something threw, so one bad frame cannot end the loop
+      if (running) scheduleAfter(interval - (performance.now() - lastDraw) - 20);
+    }
   }
 
   function queueRedraw() {
@@ -1911,6 +2081,16 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
 
   function drawNow() {
     drawFrame(performance.now());
+  }
+
+  // A renderer threw while drawing: WebGPU hands over to WebGL, the others keep trying
+  function rendererFailed(e) {
+    console.warn("[Ambient Light] Drawing failed.", e);
+    if (renderer && renderer.kind === "WebGPU" && !renderer.failed) {
+      renderer.failed = true;
+      gpuDisabled = true;
+      setTimeout(rebuildRenderer);
+    }
   }
 
   function drawFrame(now) {
@@ -1944,6 +2124,8 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       needFull = false;
       lastDraw = now;
       if (!box.classList.contains("ambl-ready")) box.classList.add("ambl-ready");
+    } catch (e) {
+      rendererFailed(e);
     } finally {
       drawing = false;
       costAvg = costAvg * 0.9 + (performance.now() - t0) * 0.1;
@@ -2027,6 +2209,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       crossfade: "Crossfade between updates (WebGPU)",
       reset: "Reset to defaults",
       renderer: "Renderer: ",
+      copying: "copying video frames",
       hint: "Press A to toggle the glow, Shift+A to open these settings.",
       button: "Ambient light settings",
     },
@@ -2058,6 +2241,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       crossfade: "업데이트 사이 크로스페이드 (WebGPU)",
       reset: "기본값으로",
       renderer: "렌더러: ",
+      copying: "영상 프레임 복사 중",
       hint: "A 키로 켜고 끄고, Shift+A로 이 설정 창을 열고 닫아요.",
       button: "앰비언트 라이트 설정",
     },
@@ -2113,12 +2297,14 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
   function togglePanel(force) {
     if (!panel) return;
     panel.classList.toggle("ambl-open", force);
+    if (panel.classList.contains("ambl-open")) updateStatus();
   }
 
 
   function updateStatus() {
     if (!statusEl) return;
-    statusEl.textContent = renderer ? tr("renderer") + renderer.kind : "";
+    const copying = renderer && renderer.copying && renderer.copying();
+    statusEl.textContent = renderer ? tr("renderer") + renderer.kind + (copying ? " (" + tr("copying") + ")" : "") : "";
   }
 
   function el(tag, cls, text) {
