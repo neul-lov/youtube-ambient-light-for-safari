@@ -16,7 +16,7 @@ Tested with Safari 27 on macOS.
 - Readability boost, so titles, buttons and descriptions stay readable on bright videos.
 - The light also falls on the comments below the video, and keeps following the video while you read them.
 - Theater mode, playlists, and optional black bar removal for letterboxed videos.
-- Pauses itself when the tab is in the background, or when neither the video nor the comments are on screen.
+- Light on resources: the glow updates 15 times a second and blends the steps, so it looks smooth while using about a third less CPU than updating 30 times a second. It pauses itself when the tab is in the background, or when neither the video nor the comments are on screen.
 - No network requests and nothing is collected. Settings are saved in your browser's local storage.
 
 ## Install (Safari on macOS)
@@ -43,14 +43,15 @@ On iPhone, YouTube serves the mobile site, which isn't supported. iPad Safari lo
 Open any video. The sun icon in the player controls (or Shift+A) opens the settings, and A turns the glow on and off.
 
 - **Blur, Edge size, Spread, Spread fade start, Spread fade curve**: the shape of the glow. They behave like the settings with the same names in the extension.
-- **Smooth motion**: blends frames so the colors change more gently.
+- **Smooth motion**: blends frames so the colors spread gently (75% by default, which hides the 15 fps steps). Lower it for a snappier glow.
 - **Brightness, Contrast, Saturation**: colors of the glow.
 - **Use dark theme**: switches YouTube to dark mode on video pages. The glow looks much better on black.
 - **Transparent header at the top, Glow through the search bar**: let the glow show behind the top bar.
 - **Readability boost**: text shadows and darker buttons. 0% turns it off.
 - **Glow on the comments**: how strongly the video's colors light up the comments. 0% turns it off.
 - **Remove black bars**: ignores letterboxing when picking colors.
-- **Frame rate limit, GPU acceleration (WebGL)**: leave WebGL on unless the glow doesn't show up at all.
+- **Frame rate limit**: how often the glow updates (15 by default). Higher values follow the video more closely but use more CPU.
+- **GPU acceleration (WebGL)**: leave it on unless the glow doesn't show up at all.
 
 The settings panel is in English, or in Korean when YouTube itself is set to Korean.
 
