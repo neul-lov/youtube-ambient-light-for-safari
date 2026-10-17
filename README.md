@@ -2,6 +2,8 @@
 
 Ambient light for YouTube in Safari. The colors at the edges of the video spill onto the page around the player, a bit like bias lighting behind a TV.
 
+<p align="center"><img src="docs/demo.gif" alt="The glow around the YouTube player in theater mode" width="720"><br><sub>Video: <a href="https://peach.blender.org/">Big Buck Bunny</a> © Blender Foundation, CC BY 3.0</sub></p>
+
 The [Ambient light for YouTube](https://github.com/WesselKroos/youtube-ambilight) extension does this in Chrome and Firefox, but there is no Safari version. So I wrote a userscript that runs in Safari with the free [Userscripts](https://apps.apple.com/app/userscripts/id1463298887) extension. It also works in YouTube web apps added to the Dock.
 
 Tested with Safari 27 on macOS.
