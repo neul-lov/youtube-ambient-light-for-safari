@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Ambient Light For Safari
 // @namespace    https://github.com/neul-lov/youtube-ambient-light-for-safari
-// @version      2.7.0
+// @version      2.8.0
 // @description  Ambient light (ambilight) for YouTube in Safari: the colors of the video glow around the player.
 // @author       neul-lov
 // @license      MIT
@@ -223,8 +223,8 @@
     html.ambl-on ytd-watch-flexy ytd-live-chat-frame {
       background: none !important;
     }
-    /* Comments in a side panel (newer layout): the script marks the panel's opaque layers,
-       so the glow beside the player shines into it. Comments under the video get the wash. */
+    /* Panels beside the player (comments, description, chat...): the script marks their opaque
+       layers, so the glow beside the player shines into them. Comments under the video get the wash. */
     html.ambl-on [data-ambl-panel-root] {
       background: var(--ambl-box) !important;
       backdrop-filter: none !important;
@@ -240,6 +240,7 @@
     /* Text: a dark halo. text-shadow is inherited, so it is set on large containers, plus on
        buttons and inputs where the browser's default style turns it off */
     html.ambl-on.ambl-read ytd-watch-flexy :is(#below, #secondary, #panels, #playlist, #chat-container),
+    html.ambl-on.ambl-read [data-ambl-panel-root],
     html.ambl-on.ambl-read ytd-watch-flexy :is(#below, #secondary, #panels, #playlist) :is(button, input, textarea),
     html.ambl-on.ambl-read #masthead-container,
     html.ambl-on.ambl-read #masthead-container :is(button, input) {
@@ -247,6 +248,7 @@
     }
     /* Icons: the same halo as a drop-shadow */
     html.ambl-on.ambl-read ytd-watch-flexy :is(#below, #secondary, #panels, #playlist) yt-icon,
+    html.ambl-on.ambl-read [data-ambl-panel-root] yt-icon,
     html.ambl-on.ambl-read #masthead-container yt-icon {
       filter: var(--ambl-icon-filter) !important;
     }
@@ -857,7 +859,7 @@
     applyReadability();
     if (S.headerTransparent) markHeader();
     if (S.searchClear) markSearchbox();
-    markCommentPanel();
+    markPanels();
     applyTheme();
     updateAtTop();
 
@@ -962,7 +964,7 @@
     player = null;
     root.classList.remove("ambl-on", "ambl-header-clear", "ambl-search-clear", "ambl-top");
     clearReadability();
-    clearCommentPanel();
+    clearPanels();
     restoreTheme();
     updateStatus();
   }
@@ -1236,59 +1238,91 @@
     paintWash();
   }
 
-  // Comments in a side panel: its markup differs between YouTube layouts, so instead of class
-  // names the script looks for the outermost opaque layer around a visible comment and marks it
-  // (translucent box) plus the wide opaque layers inside it (transparent). Each element is
-  // checked once; comments loaded later are picked up on the next round.
+  // Panels beside the player (comments, description, transcript, chat, "Ask"...): their markup
+  // differs between YouTube layouts, so instead of class names the script probes what is shown
+  // next to the player (plus visible side-panel comments and expanded engagement panels), finds
+  // the outermost opaque layer around it and marks it (translucent box) plus the wide opaque
+  // layers inside it (transparent). Each element is checked once; content loaded later is picked
+  // up on the next round.
   const THREAD_SEL = "ytd-comment-thread-renderer, ytd-comment-view-model, yt-comment-view-model";
-  let panelRoot = null;
+  const PANEL_SEL = 'ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"]';
+  let panelRoots = [];
   let panelSeen = new WeakSet();
 
-  function clearCommentPanel() {
+  function clearPanels() {
     for (const el of document.querySelectorAll("[data-ambl-panel], [data-ambl-panel-root]")) {
       el.removeAttribute("data-ambl-panel");
       el.removeAttribute("data-ambl-panel-root");
     }
-    panelRoot = null;
+    panelRoots = [];
     panelSeen = new WeakSet();
   }
 
-  function markCommentPanel() {
-    const flexy = S.commentsGlow > 0 ? document.querySelector("ytd-watch-flexy:not([hidden])") : null;
-    let thread = null;
-    if (flexy) {
-      for (const t of flexy.querySelectorAll(THREAD_SEL)) {
-        if (t.closest("#below")) continue; // under the video: handled by the wash
-        if (t.getClientRects().length) {
-          thread = t;
-          break;
-        }
+  function panelAnchors(flexy) {
+    const out = [];
+    // Whatever is shown right beside the player
+    const p = player && player.getBoundingClientRect();
+    if (p && p.width) {
+      const x = p.right + 40;
+      const y = p.top + p.height * 0.4;
+      if (x < window.innerWidth - 20 && y > 0 && y < window.innerHeight) {
+        const el = document.elementFromPoint(x, y);
+        if (el && flexy.contains(el) && !player.contains(el)) out.push(el);
       }
     }
-    if (!thread) {
-      if (panelRoot) clearCommentPanel();
+    for (const t of flexy.querySelectorAll(THREAD_SEL)) {
+      if (t.closest("#below")) continue; // under the video: handled by the wash
+      if (t.getClientRects().length) {
+        out.push(t);
+        break;
+      }
+    }
+    for (const ep of flexy.querySelectorAll(PANEL_SEL)) out.push(ep);
+    return out;
+  }
+
+  // Outermost opaque layer around an element, short of page-wide containers (the page
+  // background is handled separately) and the parts under the video (styled by the CSS above)
+  function panelRootOf(anchor, flexy) {
+    const maxW = window.innerWidth * 0.6;
+    let root = null;
+    for (let el = anchor; el && el !== flexy; el = el.parentElement) {
+      if (el.id === "below" || el.tagName === "YTD-PLAYLIST-PANEL-RENDERER" || (player && el.contains(player))) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width >= maxW) break;
+      // Panel-sized only, so a hovered video card is never taken for a panel
+      if (r.width >= 200 && r.height >= 240 && (el.hasAttribute("data-ambl-panel-root") || hasFill(getComputedStyle(el).backgroundColor))) root = el;
+    }
+    return root;
+  }
+
+  function markPanels() {
+    const flexy = document.querySelector("ytd-watch-flexy:not([hidden])");
+    if (!flexy) {
+      if (panelRoots.length) clearPanels();
       return;
     }
-    if (!panelRoot || !panelRoot.contains(thread)) {
-      // Page-wide containers are left alone (the page background is handled separately)
-      const maxW = window.innerWidth * 0.6;
-      let root = null;
-      for (let el = thread.parentElement; el && el !== flexy; el = el.parentElement) {
-        const r = el.getBoundingClientRect();
-        if (r.width >= maxW) break;
-        if (r.width >= 200 && hasFill(getComputedStyle(el).backgroundColor)) root = el;
-      }
-      if (!root) return;
-      clearCommentPanel();
-      panelRoot = root;
-      root.setAttribute("data-ambl-panel-root", "");
+    const roots = [];
+    const add = (r) => r && !roots.some((x) => x.contains(r)) && roots.push(r);
+    for (const a of panelAnchors(flexy)) add(panelRootOf(a, flexy));
+    // Keep earlier panels that are still shown (e.g. while the player is scrolled away)
+    for (const r of panelRoots) if (r.isConnected && r.getClientRects().length && flexy.contains(r)) add(r);
+    // A panel may contain one found earlier
+    const final = roots.filter((r) => !roots.some((x) => x !== r && x.contains(r)));
+
+    if (final.length !== panelRoots.length || final.some((r) => !panelRoots.includes(r))) {
+      clearPanels();
+      panelRoots = final;
+      for (const r of final) r.setAttribute("data-ambl-panel-root", "");
     }
-    const minW = panelRoot.getBoundingClientRect().width * 0.6;
-    for (const el of panelRoot.querySelectorAll("*")) {
-      if (panelSeen.has(el)) continue;
-      panelSeen.add(el);
-      if (el.getBoundingClientRect().width < minW) continue;
-      if (hasFill(getComputedStyle(el).backgroundColor)) el.setAttribute("data-ambl-panel", "");
+    for (const root of panelRoots) {
+      const minW = root.getBoundingClientRect().width * 0.6;
+      for (const el of root.querySelectorAll("*")) {
+        if (panelSeen.has(el)) continue;
+        panelSeen.add(el);
+        if (el.getBoundingClientRect().width < minW) continue;
+        if (hasFill(getComputedStyle(el).backgroundColor)) el.setAttribute("data-ambl-panel", "");
+      }
     }
   }
 
