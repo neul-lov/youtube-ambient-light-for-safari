@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Ambient Light For Safari
 // @namespace    https://github.com/neul-lov/youtube-ambient-light-for-safari
-// @version      2.8.0
+// @version      2.9.0
 // @description  Ambient light (ambilight) for YouTube in Safari: the colors of the video glow around the player.
 // @author       neul-lov
 // @license      MIT
@@ -26,8 +26,11 @@
   window.__amblLoaded = true;
 
   // ───────────────────────── Settings ─────────────────────────
-  // Defaults match the original extension, except Spread, which is wider here.
+  // Defaults match the original extension, except Spread, which is wider here, and the frame
+  // rate: the glow updates 15 times a second and Smooth motion blends the steps, which uses
+  // about a third less CPU than 30 updates a second without a visible difference.
   const STORE_KEY = "ambl-settings-v3";
+  const SETTINGS_REV = 2; // bumped when defaults change in a way that saved settings should follow
   const DEFAULTS = {
     enabled: true,
     blur: 30, // "Blur"
@@ -38,8 +41,8 @@
     brightness: 100,
     contrast: 100,
     saturation: 100,
-    smoothing: 0, // "Smooth motion" (frame blending), off by default
-    fps: 30,
+    smoothing: 75, // "Smooth motion": blend frames so the glow spreads gently (hides the 15 fps steps)
+    fps: 15,
     barDetection: false, // remove black bars (letterboxing) from the glow
     forceDark: true, // switch YouTube to the dark theme on watch pages
     headerTransparent: true, // transparent header while scrolled to the top
@@ -88,7 +91,7 @@
   function loadSettings() {
     try {
       const saved = localStorage.getItem(STORE_KEY);
-      if (saved) return sanitize(JSON.parse(saved));
+      if (saved) return sanitize(migrate(JSON.parse(saved)));
       // Migrate v2 settings but drop the old (narrow) spread value
       const old = JSON.parse(localStorage.getItem("ambl-settings-v2") || "{}");
       if (old && typeof old === "object") delete old.spread;
@@ -98,9 +101,18 @@
     }
   }
 
+  // Settings saved before rev 2 still hold the old defaults (30 fps, no smoothing); move those to the
+  // new defaults. Values the user changed from the old defaults are kept.
+  function migrate(raw) {
+    if (!raw || typeof raw !== "object" || (raw.rev || 0) >= SETTINGS_REV) return raw;
+    if (raw.fps === 30) delete raw.fps;
+    if (raw.smoothing === 0) delete raw.smoothing;
+    return raw;
+  }
+
   function saveSettings() {
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(S));
+      localStorage.setItem(STORE_KEY, JSON.stringify(Object.assign({ rev: SETTINGS_REV }, S)));
     } catch (e) {}
   }
 
@@ -320,6 +332,7 @@
   let lastRect = "";
   let running = false;
   let frameReq = 0;
+  let sleepTimer = 0;
   let usingRVFC = false;
   let lastDraw = 0;
   let lastDetect = 0;
@@ -1430,6 +1443,8 @@
 
   function stopLoop() {
     running = false;
+    clearTimeout(sleepTimer);
+    sleepTimer = 0;
     if (!frameReq) return;
     if (usingRVFC && video && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(frameReq);
     else cancelAnimationFrame(frameReq);
@@ -1440,6 +1455,20 @@
     if (!running || !video) return;
     usingRVFC = typeof video.requestVideoFrameCallback === "function";
     frameReq = usingRVFC ? video.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+  }
+
+  // Waking up for every video frame (60 times a second for 60 fps videos) costs about 5% of a CPU
+  // core in Safari even without drawing, so sleep until shortly before the next draw is due and
+  // only then wait for a video frame. The margin covers one frame of a 60 fps video plus timer slack.
+  function scheduleAfter(ms) {
+    if (ms <= 0) {
+      schedule();
+      return;
+    }
+    sleepTimer = setTimeout(() => {
+      sleepTimer = 0;
+      schedule();
+    }, ms);
   }
 
   function tick(now) {
@@ -1454,7 +1483,7 @@
     // With only the comments on screen, the colors are updated at the slower wash rate.
     const interval = Math.max(inView ? 1000 / S.fps : WASH_MS, costAvg * 10);
     if (now - lastDraw >= interval - 2) drawFrame(now);
-    schedule();
+    scheduleAfter(interval - (performance.now() - lastDraw) - 20);
   }
 
   function queueRedraw() {
