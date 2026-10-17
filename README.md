@@ -10,13 +10,13 @@ Tested with Safari 27 on macOS.
 
 ## Features
 
-- Glow around the video, drawn with WebGL. It uses the same edge projection and defaults as the extension, with a wider spread.
+- Glow around the video, drawn with WebGPU (WebGL on older Safari). It uses the same edge projection and defaults as the extension, with a wider spread.
 - Smooth in Safari: the glow is part of the page, so it scrolls with it instead of trailing behind, and the video frames are processed on the GPU.
 - At the top of the page the glow shows through the header and the search bar. Hovering the search bar fades it back to normal.
 - Readability boost, so titles, buttons and descriptions stay readable on bright videos.
 - The light also falls on the comments below the video, and keeps following the video while you read them.
 - Theater mode, playlists, and optional black bar removal for letterboxed videos.
-- Light on resources: the glow updates 15 times a second and blends the steps, so it looks smooth while using about a third less CPU than updating 30 times a second. It pauses itself when the tab is in the background, or when neither the video nor the comments are on screen.
+- Light on resources: the glow updates 15 times a second, and with WebGPU each update crossfades into the next on the compositor, so it moves continuously. WebGPU reads the video frame straight from the decoder instead of copying it. It pauses itself when the tab is in the background, or when neither the video nor the comments are on screen. The measurements behind these choices are in [youtube-ambient-light-bench](https://github.com/neul-lov/youtube-ambient-light-bench).
 - No network requests and nothing is collected. Settings are saved in your browser's local storage.
 
 ## Install (Safari on macOS)
@@ -51,7 +51,8 @@ Open any video. The sun icon in the player controls (or Shift+A) opens the setti
 - **Glow on the comments**: how strongly the video's colors light up the comments. 0% turns it off.
 - **Remove black bars**: ignores letterboxing when picking colors.
 - **Frame rate limit**: how often the glow updates (15 by default). Higher values follow the video more closely but use more CPU.
-- **GPU acceleration (WebGL)**: leave it on unless the glow doesn't show up at all.
+- **GPU acceleration, Use WebGPU**: leave both on unless the glow doesn't show up at all. Without WebGPU (or on Safari versions without it) the glow is drawn with WebGL.
+- **Crossfade between updates**: with WebGPU, each update fades in over the previous one, so the glow moves continuously. Turn it off to save a little more CPU; Smooth motion still softens the steps.
 
 The settings panel is in English, or in Korean when YouTube itself is set to Korean.
 

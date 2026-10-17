@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Ambient Light For Safari
 // @namespace    https://github.com/neul-lov/youtube-ambient-light-for-safari
-// @version      2.9.0
+// @version      3.0.0
 // @description  Ambient light (ambilight) for YouTube in Safari: the colors of the video glow around the player.
 // @author       neul-lov
 // @license      MIT
@@ -49,7 +49,9 @@
     searchClear: true, // let the glow show through the search bar (restored on hover)
     readability: 60, // text/icon halos, darker translucent boxes, dimmed header glow (0 = off)
     commentsGlow: 40, // strength of the light cast onto the comments (0 = off)
-    webgl: true,
+    webgl: true, // GPU acceleration
+    webgpu: true, // use WebGPU when available (lighter than WebGL), else WebGL
+    crossfade: true, // WebGPU only: fade each update in over the previous one, so 15 fps looks continuous
   };
 
   // Valid range of every numeric setting (also used by the sliders)
@@ -131,13 +133,15 @@
       contain: strict;
     }
     /* The canvas stays tiny; it is only scaled up with a CSS transform. */
-    #ambl-root canvas {
+    #ambl-root > canvas, #ambl-root > .ambl-glow {
       position: absolute; left: 0; top: 0; display: block;
       transform-origin: 0 0; -webkit-transform-origin: 0 0;
       opacity: 0; transition: opacity .4s ease;
       will-change: transform;
     }
-    #ambl-root.ambl-ready canvas { opacity: 1; }
+    #ambl-root.ambl-ready > canvas, #ambl-root.ambl-ready > .ambl-glow { opacity: 1; }
+    /* WebGPU: two stacked canvases; each update fades in over the previous one */
+    #ambl-root .ambl-glow > canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
 
     /* Page background: pure black in the dark theme */
     html.ambl-on[dark], html.ambl-on[dark] body, html.ambl-on[dark] ytd-app { background: #000 !important; }
@@ -807,7 +811,388 @@
     };
   }
 
-  function createRenderer() {
+  // ───────────────────────── Renderer: WebGPU ─────────────────────────
+  // The same passes as the WebGL renderer, with three differences:
+  // - The video frame is sampled straight from the decoder's output (importExternalTexture), so a
+  //   full-size copy of every frame is never made.
+  // - Readbacks (black bars, comments glow) are asynchronous and never stall the GPU. Their result
+  //   is one update behind, which nothing here notices.
+  // - The result goes into one of two stacked canvases, and each update fades in over the previous
+  //   one on the compositor ("crossfade"), so 15 updates a second look continuous. The glow is
+  //   composited over the page background in the shader, which makes both canvases opaque; fading
+  //   one opaque canvas over another is an exact blend, without the brighter edges that fading
+  //   translucent layers would show.
+  const WGSL_VS = `
+struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
+  var p = array<vec2f, 4>(vec2f(-1., -1.), vec2f(1., -1.), vec2f(-1., 1.), vec2f(1., 1.));
+  var o: VOut;
+  o.pos = vec4f(p[i], 0., 1.);
+  o.uv = vec2f(p[i].x * .5 + .5, .5 - p[i].y * .5); // y down, like the video and all textures
+  return o;
+}`;
+
+  // 4x4 taps of a source rect (x, y, w, h), like FS_SAMPLE
+  const wgslSample = (external) => WGSL_VS + `
+struct U { src: vec4f, tap: vec4f };
+@group(0) @binding(0) var smp: sampler;
+@group(0) @binding(1) var tex: ${external ? "texture_external" : "texture_2d<f32>"};
+@group(0) @binding(2) var<uniform> u: U;
+fn fetch(c: vec2f) -> vec3f {
+  return ${external ? "textureSampleBaseClampToEdge(tex, smp, c)" : "textureSampleLevel(tex, smp, c, 0.)"}.rgb;
+}
+@fragment fn fs(in: VOut) -> @location(0) vec4f {
+  let lo = u.src.xy;
+  let hi = u.src.xy + u.src.zw;
+  let b = lo + in.uv * u.src.zw;
+  var sum = vec3f(0.);
+  for (var i = 0; i < 4; i++) {
+    for (var j = 0; j < 4; j++) {
+      sum += fetch(clamp(b + (vec2f(f32(i), f32(j)) - 1.5) * u.tap.xy, lo, hi));
+    }
+  }
+  return vec4f(sum / 16., 1.);
+}`;
+
+  // Port of FS_PROJECT (edge rings + spread fade)
+  const WGSL_PROJECT = WGSL_VS + `
+struct U { area: vec4f, scale: vec2f, stp: vec2f, marg: vec2f, fade: vec2f, maxRing: f32 };
+@group(0) @binding(0) var smp: sampler;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+fn vis(d: f32, m: f32) -> f32 {
+  if (m <= 0.) { return select(0., 1., d <= 0.); }
+  let x = clamp((1. - d / m) / (1. - u.fade.x), 0., 1.);
+  return 1. - pow(1. - x, u.fade.y);
+}
+@fragment fn fs(in: VOut) -> @location(0) vec4f {
+  let f = (in.uv - u.area.xy) / u.area.zw;
+  if (any(f < vec2f(0.)) || any(f > vec2f(1.))) { return vec4f(0.); }
+  let dir = ceil(f * 2.) - 1.;
+  let iuv = ((dir - f) * u.scale) / ((dir - .5) * u.stp);
+  let i = min(floor(min(iuv.x, iuv.y)), u.maxRing);
+  let s = (f - .5) * (u.scale / max(u.scale - u.stp * i, vec2f(.05))) + .5;
+  let c = textureSampleLevel(tex, smp, s, 0.).rgb;
+  let d = max(u.marg - f, f - (1. - u.marg));
+  let a = vis(d.x, u.marg.x) * vis(d.y, u.marg.y);
+  return vec4f(c * a, a);
+}`;
+
+  // Separable Gaussian blur; the final pass also applies brightness / contrast / saturation and
+  // composites over the page background (bg), so the canvas is opaque
+  const wgslBlur = (final) => WGSL_VS + `
+struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
+@group(0) @binding(0) var smp: sampler;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+@fragment fn fs(in: VOut) -> @location(0) vec4f {
+  var sum = vec4f(0.);
+  var ws = 0.;
+  for (var i = -12; i <= 12; i++) {
+    let x = f32(i);
+    let w = exp(-.5 * x * x / (u.sigma * u.sigma));
+    sum += textureSampleLevel(tex, smp, in.uv + u.dir * x, 0.) * w;
+    ws += w;
+  }
+  sum = sum / ws;
+  ${final ? `let a = sum.a;
+  var c = select(vec3f(0.), sum.rgb / a, a > .0001);
+  c = (c - .5) * u.adj.y + .5;
+  c *= u.adj.x;
+  c = mix(vec3f(dot(c, vec3f(.2126, .7152, .0722))), c, u.adj.z);
+  return vec4f(clamp(c, vec3f(0.), vec3f(1.)) * a + u.bg.rgb * (1. - a), 1.);` : "return sum;"}
+}`;
+
+  let gpuDisabled = false; // set after a WebGPU error: WebGL is used for the rest of the page
+  let gpuLosses = 0;
+
+  async function createGPURenderer() {
+    if (!navigator.gpu) return null;
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "low-power" });
+    if (!adapter) return null;
+    const device = await adapter.requestDevice();
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    let destroyed = false;
+    let lost = false;
+
+    const fail = (why) => {
+      if (destroyed || lost) return;
+      lost = true;
+      console.warn("[Ambient Light] WebGPU stopped working; switching renderers.", why);
+      setTimeout(rebuildRenderer);
+    };
+    // Also resolves when the device is destroyed on purpose (renderer rebuilt), which is not a loss
+    device.lost.then((info) => {
+      if (destroyed || (info && info.reason === "destroyed")) return;
+      gpuLosses++;
+      fail(info && info.message);
+    });
+    device.addEventListener("uncapturederror", (e) => {
+      if (destroyed) return;
+      gpuDisabled = true;
+      fail(e.error && e.error.message);
+    });
+
+    const wrap = document.createElement("div");
+    wrap.className = "ambl-glow";
+    const cv = [0, 1].map(() => wrap.appendChild(document.createElement("canvas")));
+    const ctx = cv.map((c) => {
+      const x = c.getContext("webgpu");
+      x.configure({ device, format, alphaMode: "opaque" });
+      return x;
+    });
+
+    device.pushErrorScope("validation");
+    const mod = (code) => device.createShaderModule({ code });
+    const pipe = (m, fmt, blend) =>
+      device.createRenderPipeline({
+        layout: "auto",
+        vertex: { module: m, entryPoint: "vs" },
+        fragment: { module: m, entryPoint: "fs", targets: [{ format: fmt, blend }] },
+        primitive: { topology: "triangle-strip" },
+      });
+    // Frame blending: new = frame * a + previous * (1 - a), with a passed as the blend constant
+    const BLEND = {
+      color: { srcFactor: "constant", dstFactor: "one-minus-constant" },
+      alpha: { srcFactor: "constant", dstFactor: "one-minus-constant" },
+    };
+    const mExt = mod(wgslSample(true));
+    const mTex = mod(wgslSample(false));
+    const P = {
+      ext8: pipe(mExt, "rgba8unorm"), // video → downscale buffer / bar detection
+      extSrc: pipe(mExt, "rgba16float", BLEND), // video → blended buffer
+      midSrc: pipe(mTex, "rgba16float", BLEND), // downscale buffer → blended buffer
+      wash: pipe(mTex, "rgba8unorm"), // blended buffer → comments glow colors
+      project: pipe(mod(WGSL_PROJECT), "rgba8unorm"),
+      blur: pipe(mod(wgslBlur(false)), "rgba8unorm"),
+      final: pipe(mod(wgslBlur(true)), format),
+    };
+    const err = await device.popErrorScope();
+    if (err) {
+      destroyed = true;
+      device.destroy();
+      throw new Error(err.message);
+    }
+
+    const smp = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+    const ubuf = (size) => device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const U = { mid: ubuf(32), src: ubuf(32), det: ubuf(32), wash: ubuf(32), project: ubuf(64), blur: ubuf(48), final: ubuf(48) };
+    const put = (b, values) => device.queue.writeBuffer(b, 0, new Float32Array(values));
+    const target = (w, h, fmt = "rgba8unorm", usage = 0) =>
+      device.createTexture({ size: [w, h], format: fmt, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | usage });
+    const group = (pipeline, resource, buffer) =>
+      device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: smp }, { binding: 1, resource }, { binding: 2, resource: { buffer } }],
+      });
+    const pass = (enc, view, pipeline, bindGroup, blend) => {
+      const rp = enc.beginRenderPass({
+        colorAttachments: [{ view, loadOp: blend === undefined ? "clear" : "load", storeOp: "store", clearValue: [0, 0, 0, 0] }],
+      });
+      rp.setPipeline(pipeline);
+      rp.setBindGroup(0, bindGroup);
+      if (blend !== undefined) rp.setBlendConstant([blend, blend, blend, blend]);
+      rp.draw(4);
+      rp.end();
+    };
+
+    // Asynchronous readback: copy now, map later, hand out the previous result
+    const readback = (tex, w, h) => {
+      const bytesPerRow = Math.ceil((w * 4) / 256) * 256;
+      const buf = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const out = new Uint8Array(w * h * 4);
+      let busy = false;
+      let ready = false;
+      return {
+        copy(enc) {
+          if (busy) return false;
+          enc.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow }, [w, h]);
+          return true;
+        },
+        map() {
+          busy = true;
+          buf.mapAsync(GPUMapMode.READ).then(
+            () => {
+              const d = new Uint8Array(buf.getMappedRange());
+              for (let y = 0; y < h; y++) out.set(d.subarray(y * bytesPerRow, y * bytesPerRow + w * 4), y * w * 4);
+              buf.unmap();
+              busy = false;
+              ready = true;
+            },
+            () => (busy = false)
+          );
+        },
+        result: () => (ready ? { data: out, flipY: false } : null),
+      };
+    };
+    const det = target(DET_W, DET_H, "rgba8unorm", GPUTextureUsage.COPY_SRC);
+    const washT = target(WASH_W, WASH_ROWS, "rgba8unorm", GPUTextureUsage.COPY_SRC);
+    const detRB = readback(det, DET_W, DET_H);
+    const washRB = readback(washT, WASH_W, WASH_ROWS);
+
+    let mid = null, src = null, proj = null, tmp = null;
+    let sw = 0, sh = 0, mw = 0, mh = 0, bw = 0, bh = 0;
+    let gMid = null, gProject = null, gWash = null, gBlur = null, gFinal = null;
+    let ext = null; // this update's video frame (valid until the current task ends)
+    let topShown = true; // whether the top canvas (1) is showing (or fading in)
+    let topFade = null; // the top canvas's opacity animation, reversed on every update
+    let fresh = true; // both canvases need content (first draw or after a resize)
+    let pending = null; // command encoder of the current update
+    const encoder = () => pending || (pending = device.createCommandEncoder());
+    const flush = () => {
+      if (!pending) return;
+      device.queue.submit([pending.finish()]);
+      pending = null;
+    };
+
+    return {
+      kind: "WebGPU",
+      canvas: wrap,
+      cssFilter: false,
+
+      setGeometry(g) {
+        if (lost) return false;
+        let resized = false;
+        if (g.sw !== sw || g.sh !== sh || !src) {
+          sw = g.sw;
+          sh = g.sh;
+          if (src) src.destroy();
+          src = target(sw, sh, "rgba16float");
+          gProject = group(P.project, src.createView(), U.project);
+          gWash = group(P.wash, src.createView(), U.wash);
+          resized = true;
+        }
+        if (g.mw !== mw || g.mh !== mh) {
+          mw = g.mw;
+          mh = g.mh;
+          if (mid) mid.destroy();
+          mid = mw ? target(mw, mh) : null;
+          gMid = mid ? group(P.midSrc, mid.createView(), U.src) : null;
+        }
+        if (g.bw !== bw || g.bh !== bh || !proj) {
+          bw = g.bw;
+          bh = g.bh;
+          for (const c of cv) {
+            c.width = bw;
+            c.height = bh;
+          }
+          if (proj) proj.destroy();
+          if (tmp) tmp.destroy();
+          proj = target(bw, bh);
+          tmp = target(bw, bh);
+          gBlur = group(P.blur, proj.createView(), U.blur);
+          gFinal = group(P.final, tmp.createView(), U.final);
+          fresh = true;
+          resized = true;
+        }
+        return resized;
+      },
+
+      upload(v) {
+        ext = null;
+        if (lost || !src) return false;
+        try {
+          ext = device.importExternalTexture({ source: v });
+        } catch (e) {
+          return false;
+        }
+        return true;
+      },
+
+      // All of an update's work goes into one command encoder, submitted once (fewer messages to
+      // Safari's GPU process); readbacks submit early because they map their buffer afterwards
+      detect() {
+        if (lost || !ext) return null;
+        put(U.det, [0, 0, 1, 1, 1 / DET_W / 4, 1 / DET_H / 4, 0, 0]);
+        pass(encoder(), det.createView(), P.ext8, group(P.ext8, ext, U.det));
+        const copied = detRB.copy(encoder());
+        flush();
+        if (copied) detRB.map();
+        return detRB.result();
+      },
+
+      sampleWash() {
+        if (lost || !src) return null;
+        put(U.wash, [0, 0, 1, 1, 1 / WASH_W / 4, 1 / WASH_ROWS / 4, 0, 0]);
+        pass(encoder(), washT.createView(), P.wash, gWash);
+        const copied = washRB.copy(encoder());
+        flush();
+        if (copied) washRB.map();
+        return washRB.result();
+      },
+
+      accumulate(a) {
+        if (lost || !ext || !src) return;
+        const c = [crop.l, crop.t, 1 - crop.l - crop.r, 1 - crop.t - crop.b];
+        if (mid) {
+          put(U.mid, [...c, c[2] / mw / 4, c[3] / mh / 4, 0, 0]);
+          pass(encoder(), mid.createView(), P.ext8, group(P.ext8, ext, U.mid));
+          put(U.src, [0, 0, 1, 1, 1 / sw / 4, 1 / sh / 4, 0, 0]);
+          pass(encoder(), src.createView(), P.midSrc, gMid, a);
+        } else {
+          put(U.src, [...c, c[2] / sw / 4, c[3] / sh / 4, 0, 0]);
+          pass(encoder(), src.createView(), P.extSrc, group(P.extSrc, ext, U.src), a);
+        }
+      },
+
+      post() {
+        if (lost || !src || !proj || !geo) return;
+        // Space the 25 taps so they cover ±3σ
+        const s = Math.max(0.5, geo.sigma);
+        const step = Math.max(1, s / 4);
+        const sigma = s / step;
+        const bg = root.hasAttribute("dark") ? 0 : 1; // the page background (see the styles)
+        put(U.project, [...geo.area, ...geo.scale, ...geo.step, ...geo.marg, ...geo.fade, geo.maxRing, 0, 0, 0]);
+        put(U.blur, [step / bw, 0, sigma, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        put(U.final, [0, step / bh, sigma, 0, S.brightness / 100, S.contrast / 100, S.saturation / 100, 0, bg, bg, bg, 0]);
+
+        // The z-order of the two canvases never changes: the top one (1) fades in or out. A new
+        // frame goes into the canvas that is hidden right now (the bottom one while the top one is
+        // showing, else the top one), then the top one fades out or in to reveal it. Changing the
+        // z-order instead would make Safari update the whole page's layers on every update.
+        const fade = S.crossfade && !fresh;
+        const next = fade ? (topShown ? 0 : 1) : topShown ? 1 : 0;
+        const enc = encoder();
+        pass(enc, proj.createView(), P.project, gProject);
+        pass(enc, tmp.createView(), P.blur, gBlur);
+        for (const n of fresh ? [0, 1] : [next]) pass(enc, ctx[n].getCurrentTexture().createView(), P.final, gFinal);
+        flush();
+        fresh = false;
+
+        if (fade) {
+          const dur = Math.round(900 / S.fps); // about one update interval
+          if (!topFade) {
+            topFade = cv[1].animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur, easing: "linear", fill: "both" });
+            topFade.finish(); // start with the top canvas showing
+          } else if (topFade.effect.getTiming().duration !== dur) {
+            topFade.effect.updateTiming({ duration: dur });
+          }
+          topFade.reverse(); // fades out when showing, in when hidden (from wherever it is)
+          topShown = !topShown;
+        }
+      },
+
+      flush,
+
+      destroy() {
+        destroyed = true;
+        wrap.remove();
+        device.destroy();
+      },
+    };
+  }
+
+  // WebGPU → WebGL → Canvas2D. WebGPU needs an async setup, so renderers are created asynchronously.
+  async function createRenderer() {
+    if (S.webgl && S.webgpu && !gpuDisabled && gpuLosses < 2 && navigator.gpu) {
+      try {
+        const r = await createGPURenderer();
+        if (r) return r;
+      } catch (e) {
+        gpuDisabled = true;
+        console.warn("[Ambient Light] WebGPU is unavailable, falling back to WebGL.", e);
+      }
+    }
     if (S.webgl) {
       try {
         const r = createGLRenderer();
@@ -819,18 +1204,53 @@
     return create2DRenderer();
   }
 
-  function rebuildRenderer() {
+  let rendererGen = 0; // bumped whenever the current or pending renderer is dropped
+  let pendingGen = 0;
+
+  function startRenderer() {
+    if (renderer || pendingGen || !box) return;
+    const gen = (pendingGen = ++rendererGen);
+    createRenderer().then((r) => {
+      if (pendingGen === gen) pendingGen = 0;
+      if (gen !== rendererGen || !box) {
+        r.destroy();
+        return;
+      }
+      renderer = r;
+      placeGlow();
+      updateStatus();
+      needFull = true;
+      geo = null;
+      lastRect = "";
+      layout();
+      drawNow();
+      restartLoop();
+    }, (e) => {
+      if (pendingGen === gen) pendingGen = 0;
+      console.warn("[Ambient Light] Could not create a renderer.", e);
+    });
+  }
+
+  // The glow goes below the comments glow, which stays on top (the WebGPU glow is opaque)
+  function placeGlow() {
+    if (!renderer || !box) return;
+    const above = wash && wash.canvas.parentElement === box ? wash.canvas : null;
+    if (renderer.canvas.parentElement !== box || renderer.canvas.nextSibling !== above) box.insertBefore(renderer.canvas, above);
+  }
+
+  function dropRenderer() {
+    rendererGen++;
+    pendingGen = 0;
     if (renderer) renderer.destroy();
     renderer = null;
     geo = null;
     lastRect = "";
-    if (!box) return;
-    renderer = createRenderer();
-    box.appendChild(renderer.canvas);
+  }
+
+  function rebuildRenderer() {
+    dropRenderer();
     updateStatus();
-    needFull = true;
-    layout();
-    drawNow();
+    startRenderer();
   }
 
   // ───────────────────────── Attach / detach ─────────────────────────
@@ -918,11 +1338,8 @@
       viewObs.observe(video);
     }
 
-    if (!renderer) {
-      renderer = createRenderer();
-      updateStatus();
-    }
-    if (renderer.canvas.parentElement !== box) box.appendChild(renderer.canvas);
+    if (!renderer) startRenderer();
+    else placeGlow();
 
     needFull = true;
     geo = null;
@@ -965,10 +1382,7 @@
     if (viewObs) viewObs.disconnect();
     viewObs = null;
     // Release GPU memory (video texture etc.)
-    if (renderer) renderer.destroy();
-    renderer = null;
-    geo = null;
-    lastRect = "";
+    dropRenderer();
     if (box) {
       box.classList.remove("ambl-ready");
       box.remove();
@@ -1143,8 +1557,8 @@
         washInView = true;
       }
     }
-    // Below the main glow canvas, so the glow around the player stays on top
-    if (wash.canvas.parentElement !== box || box.firstChild !== wash.canvas) box.insertBefore(wash.canvas, box.firstChild);
+    // Above the main glow: the WebGPU glow is opaque and would hide it
+    if (wash.canvas.parentElement !== box || box.lastChild !== wash.canvas) box.appendChild(wash.canvas);
 
     // Follow the comments' size (more loaded) and position (description expanded etc.)
     if (wash.target !== c.el) {
@@ -1524,6 +1938,8 @@
         lastWash = now;
         updateWash();
       }
+      // WebGPU: submit whatever is still queued (the video frame expires at the end of this task)
+      if (renderer.flush) renderer.flush();
 
       needFull = false;
       lastDraw = now;
@@ -1606,7 +2022,9 @@
       barDetection: "Remove black bars",
       secPerf: "PERFORMANCE",
       fps: "Frame rate limit",
-      webgl: "GPU acceleration (WebGL)",
+      webgl: "GPU acceleration",
+      webgpu: "Use WebGPU (lighter than WebGL)",
+      crossfade: "Crossfade between updates (WebGPU)",
       reset: "Reset to defaults",
       renderer: "Renderer: ",
       hint: "Press A to toggle the glow, Shift+A to open these settings.",
@@ -1635,7 +2053,9 @@
       barDetection: "검은 띠 제거",
       secPerf: "성능",
       fps: "프레임 제한",
-      webgl: "GPU 가속 (WebGL)",
+      webgl: "GPU 가속",
+      webgpu: "WebGPU 사용 (WebGL보다 가벼움)",
+      crossfade: "업데이트 사이 크로스페이드 (WebGPU)",
       reset: "기본값으로",
       renderer: "렌더러: ",
       hint: "A 키로 켜고 끄고, Shift+A로 이 설정 창을 열고 닫아요.",
@@ -1799,10 +2219,12 @@
     addSection(panel, tr("secPerf"));
     addSlider(panel, "fps", tr("fps"), 5, " fps");
     addCheck(panel, "webgl", tr("webgl"), () => setTimeout(rebuildRenderer));
+    addCheck(panel, "webgpu", tr("webgpu"), () => setTimeout(rebuildRenderer));
+    addCheck(panel, "crossfade", tr("crossfade"));
 
     const reset = el("button", "ambl-reset", tr("reset"));
     reset.addEventListener("click", () => {
-      const glChanged = S.webgl !== DEFAULTS.webgl;
+      const glChanged = S.webgl !== DEFAULTS.webgl || S.webgpu !== DEFAULTS.webgpu;
       S = Object.assign({}, DEFAULTS);
       Object.values(inputs).forEach((i) => i.sync());
       resetCrop();
@@ -1867,10 +2289,10 @@
   // Pick up setting changes made in other tabs
   window.addEventListener("storage", (e) => {
     if (e.key !== STORE_KEY) return;
-    const prevGL = S.webgl;
+    const prevGL = S.webgl + "," + S.webgpu;
     S = loadSettings();
     Object.values(inputs).forEach((i) => i.sync());
-    if (prevGL !== S.webgl) rebuildRenderer();
+    if (prevGL !== S.webgl + "," + S.webgpu) rebuildRenderer();
     onChange(false);
   });
 
