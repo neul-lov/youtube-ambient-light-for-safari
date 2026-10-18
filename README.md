@@ -59,6 +59,7 @@ The settings panel is in English, or in Korean when YouTube itself is set to Kor
 ## Notes
 
 - The glow is turned off in fullscreen.
+- With WebGPU, the settings panel may say "copying video frames". Safari can't hand some videos to WebGPU directly (they come out black), so their frames are copied instead. The glow still works, and it still uses less CPU than WebGL.
 - YouTube changes its page layout fairly often. If something looks wrong, please open an issue.
 
 ## Credits
