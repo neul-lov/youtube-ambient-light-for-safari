@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Ambient Light For Safari
 // @namespace    https://github.com/neul-lov/youtube-ambient-light-for-safari
-// @version      3.0.1
+// @version      3.1.0
 // @description  Ambient light (ambilight) for YouTube in Safari: the colors of the video glow around the player.
 // @author       neul-lov
 // @license      MIT
@@ -26,11 +26,10 @@
   window.__amblLoaded = true;
 
   // ───────────────────────── Settings ─────────────────────────
-  // Defaults match the original extension, except Spread, which is wider here, and the frame
-  // rate: the glow updates 15 times a second and Smooth motion blends the steps, which uses
-  // about a third less CPU than 30 updates a second without a visible difference.
+  // Defaults match the original extension, except Spread, which is wider here. The glow follows
+  // every video frame (up to 60 a second); fewer updates save CPU but look choppy on fast scenes.
   const STORE_KEY = "ambl-settings-v3";
-  const SETTINGS_REV = 2; // bumped when defaults change in a way that saved settings should follow
+  const SETTINGS_REV = 3; // bumped when defaults change in a way that saved settings should follow
   const DEFAULTS = {
     enabled: true,
     blur: 30, // "Blur"
@@ -41,8 +40,8 @@
     brightness: 100,
     contrast: 100,
     saturation: 100,
-    smoothing: 75, // "Smooth motion": blend frames so the glow spreads gently (hides the 15 fps steps)
-    fps: 15,
+    smoothing: 75, // "Smooth motion": blend frames so the glow spreads gently
+    fps: 60, // update limit; the glow never updates faster than the video's own frames
     barDetection: false, // remove black bars (letterboxing) from the glow
     forceDark: true, // switch YouTube to the dark theme on watch pages
     headerTransparent: true, // transparent header while scrolled to the top
@@ -103,12 +102,16 @@
     }
   }
 
-  // Settings saved before rev 2 still hold the old defaults (30 fps, no smoothing); move those to the
-  // new defaults. Values the user changed from the old defaults are kept.
+  // Saved settings that still hold an old default move to the new one; values the user changed
+  // are kept. Rev 2: 30 fps / no smoothing → 15 fps / 75%. Rev 3: 15 fps → 60 fps.
   function migrate(raw) {
-    if (!raw || typeof raw !== "object" || (raw.rev || 0) >= SETTINGS_REV) return raw;
-    if (raw.fps === 30) delete raw.fps;
-    if (raw.smoothing === 0) delete raw.smoothing;
+    if (!raw || typeof raw !== "object") return raw;
+    const rev = raw.rev || 0;
+    if (rev < 2) {
+      if (raw.fps === 30) delete raw.fps;
+      if (raw.smoothing === 0) delete raw.smoothing;
+    }
+    if (rev < 3 && raw.fps === 15) delete raw.fps;
     return raw;
   }
 
@@ -817,9 +820,9 @@
 
   // ───────────────────────── Renderer: WebGPU ─────────────────────────
   // The same passes as the WebGL renderer, with three differences:
-  // - The video frame is sampled straight from the decoder's output (importExternalTexture), so a
-  //   full-size copy of every frame is not needed. Videos that Safari can't hand over that way are
-  //   detected and copied instead (see "Reading the video frame" below).
+  // - The video frame is sampled straight from the decoder's output (importExternalTexture of a
+  //   VideoFrame), so a full-size copy of every frame is not needed. Videos that Safari can't hand
+  //   over that way are detected and copied instead (see "Reading the video frame" below).
   // - Readbacks (black bars, comments glow) are asynchronous and never stall the GPU. Their result
   //   is one update behind, which nothing here notices.
   // - The result goes into one of two stacked canvases, and each update fades in over the previous
@@ -1042,6 +1045,8 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
     let ext = null; // this update's video frame (valid until the current task ends)
     let topShown = true; // whether the top canvas (1) is showing (or fading in)
     let topFade = null; // the top canvas's opacity animation, reversed on every update
+    let lastPost = 0;
+    let gapAvg = 0; // average time between updates, which each fade should last
     let fresh = true; // both canvases need content (first draw or after a resize)
     let pending = null; // command encoder of the current update
     const encoder = () => pending || (pending = device.createCommandEncoder());
@@ -1052,12 +1057,32 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
     };
 
     // ── Reading the video frame ──
-    // importExternalTexture samples the decoder's output directly, but in Safari some videos come
-    // out all black that way, without any error (it depends on how the video is decoded). So each
-    // video is checked: a small downscale through the external texture is compared with three
-    // small regions copied with copyExternalImageToTexture, which converts the frame the way WebGL
-    // does. Until the external texture is known to show the current video, and for videos where it
-    // doesn't, the whole frame is copied instead (correct, but a full-size copy per update).
+    // importExternalTexture samples the decoder's output directly. Given the <video> element, Safari
+    // returns an all-black frame for many videos, without any error. Given a WebCodecs VideoFrame
+    // made from the element it converts the frame another way, which shows those videos and keeps
+    // the zero-copy path (about 0.4 ms of main thread per update for 4K, against about 12 ms for
+    // copying the frame). So frames are imported through a VideoFrame where possible.
+    // As a safety net each video is still checked: a small downscale through the external texture
+    // is compared with three small regions copied with copyExternalImageToTexture, which converts
+    // the frame the way WebGL does. Until the external texture is known to show the current video,
+    // and for videos where it doesn't, the whole frame is copied instead.
+    let vframe = null; // the VideoFrame the current external texture comes from
+    const importFrame = (v) => {
+      if (vframe) {
+        vframe.close(); // the previous update's work is already submitted
+        vframe = null;
+      }
+      if (typeof VideoFrame === "function") {
+        try {
+          vframe = new VideoFrame(v);
+          return device.importExternalTexture({ source: vframe });
+        } catch (e) {
+          if (vframe) vframe.close();
+          vframe = null;
+        }
+      }
+      return device.importExternalTexture({ source: v });
+    };
     const CHK_W = 32, CHK_H = 18, PROBE_W = 64, PROBE_H = 36;
     const chk = target(CHK_W, CHK_H, "rgba8unorm", GPUTextureUsage.COPY_SRC);
     const probe = device.createTexture({
@@ -1201,8 +1226,12 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
           failingSince = 0;
         }
         try {
+          if (extBroken && vframe) {
+            vframe.close(); // copying only: don't hold on to a decoder frame
+            vframe = null;
+          }
           if (!extBroken) {
-            ext = device.importExternalTexture({ source: v });
+            ext = importFrame(v);
             // Until it works check twice a second; once it works, every 10 s (the decoder can change
             // without the size changing)
             const since = performance.now() - lastCheck;
@@ -1288,11 +1317,22 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
         // frame goes into the canvas that is hidden right now (the bottom one while the top one is
         // showing, else the top one), then the top one fades out or in to reveal it. Changing the
         // z-order instead would make Safari update the whole page's layers on every update.
-        // A paused video gets no later update that would reveal a hidden canvas, so it doesn't fade:
-        // with crossfade on, both canvases get the frame; with it off, only the visible one
-        const fade = S.crossfade && !fresh && !!video && !video.paused;
+        // Each fade lasts about as long as the gap to the next update, measured rather than taken from
+        // the frame limit: the video's frame rate, throttling and timers decide the real gap, and a
+        // fade that ends early leaves a visible step until the next frame
+        const now = performance.now();
+        const gap = now - lastPost;
+        lastPost = now;
+        if (gap > 0 && gap < 250) gapAvg = gapAvg ? gapAvg * 0.8 + gap * 0.2 : gap;
+        // Above about 40 updates a second a new frame comes every few ms and fading adds nothing you
+        // can see, while it costs CPU (about 7% of a core at 60 updates a second), so it is skipped.
+        // A paused video gets no later update that would reveal a hidden canvas, so it doesn't fade
+        // either: with crossfade on, both canvases get the frame; otherwise only the visible one.
+        const fast = gapAvg > 0 && gapAvg < 25;
+        const paused = !video || video.paused;
+        const fade = S.crossfade && !fresh && !paused && !fast;
         const visible = topShown ? 1 : 0;
-        const targets = fresh || (S.crossfade && !fade) ? [0, 1] : fade ? [1 - visible] : [visible];
+        const targets = fresh || (S.crossfade && paused) ? [0, 1] : fade ? [1 - visible] : [visible];
         const enc = encoder();
         pass(enc, proj.createView(), P.project, gProject);
         pass(enc, tmp.createView(), P.blur, gBlur);
@@ -1301,11 +1341,11 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
         fresh = false;
 
         if (fade) {
-          const dur = Math.round(900 / S.fps); // about one update interval
+          const dur = clamp(Math.round((gapAvg || 1000 / S.fps) / 4) * 4, 12, 240);
           if (!topFade) {
             topFade = cv[1].animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur, easing: "linear", fill: "both" });
             topFade.finish(); // start with the top canvas showing
-          } else if (topFade.effect.getTiming().duration !== dur) {
+          } else if (Math.abs(topFade.effect.getTiming().duration - dur) > dur * 0.15) {
             topFade.effect.updateTiming({ duration: dur });
           }
           topFade.reverse(); // fades out when showing, in when hidden (from wherever it is)
@@ -1320,6 +1360,8 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
 
       destroy() {
         destroyed = true;
+        if (vframe) vframe.close();
+        vframe = null;
         wrap.remove();
         device.destroy();
       },
@@ -2059,11 +2101,13 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       running = false;
       return;
     }
-    // If drawing gets expensive, back off so the main thread stays under ~10% usage.
+    // If drawing gets expensive, back off so the main thread stays under about a third of its time
+    // (smooth motion matters more than a few % of CPU; this only protects slow machines).
     // With only the comments on screen, the colors are updated at the slower wash rate.
-    const interval = Math.max(inView ? 1000 / S.fps : WASH_MS, costAvg * 10);
+    const interval = Math.max(inView ? 1000 / S.fps : WASH_MS, costAvg * 3);
     try {
-      if (now - lastDraw >= interval - 2) drawFrame(now);
+      // A few ms of slack: frame callbacks jitter, and skipping one at the video's own rate shows
+      if (now - lastDraw >= interval - 4) drawFrame(now);
     } finally {
       // Re-arm even if something threw, so one bad frame cannot end the loop
       if (running) scheduleAfter(interval - (performance.now() - lastDraw) - 20);
