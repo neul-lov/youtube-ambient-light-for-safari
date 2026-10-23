@@ -16,7 +16,7 @@ Tested with Safari 27 on macOS.
 - Readability boost, so titles, buttons and descriptions stay readable on bright videos.
 - The light also falls on the comments below the video, and keeps following the video while you read them.
 - Theater mode, playlists, and optional black bar removal for letterboxed videos.
-- Light on resources: the glow updates 15 times a second, and with WebGPU each update crossfades into the next on the compositor, so it moves continuously. WebGPU reads the video frame straight from the decoder instead of copying it. It pauses itself when the tab is in the background, or when neither the video nor the comments are on screen. The measurements behind these choices are in [youtube-ambient-light-bench](https://github.com/neul-lov/youtube-ambient-light-bench).
+- Smooth on fast scenes: the glow follows every video frame (up to 60 a second), and with WebGPU, 24–30 fps videos crossfade from frame to frame on the compositor. WebGPU reads the video frame straight from the decoder instead of copying it. It pauses itself when the tab is in the background, or when neither the video nor the comments are on screen. The measurements behind these choices are in [youtube-ambient-light-bench](https://github.com/neul-lov/youtube-ambient-light-bench).
 - No network requests and nothing is collected. Settings are saved in your browser's local storage.
 
 ## Install (Safari on macOS)
@@ -43,16 +43,16 @@ On iPhone, YouTube serves the mobile site, which isn't supported. iPad Safari lo
 Open any video. The sun icon in the player controls (or Shift+A) opens the settings, and A turns the glow on and off.
 
 - **Blur, Edge size, Spread, Spread fade start, Spread fade curve**: the shape of the glow. They behave like the settings with the same names in the extension.
-- **Smooth motion**: blends frames so the colors spread gently (75% by default, which hides the 15 fps steps). Lower it for a snappier glow.
+- **Smooth motion**: blends frames so the colors spread gently (75% by default). Lower it for a snappier glow.
 - **Brightness, Contrast, Saturation**: colors of the glow.
 - **Use dark theme**: switches YouTube to dark mode on video pages. The glow looks much better on black.
 - **Transparent header at the top, Glow through the search bar**: let the glow show behind the top bar.
 - **Readability boost**: text shadows and darker buttons. 0% turns it off.
 - **Glow on the comments**: how strongly the video's colors light up the comments. 0% turns it off.
 - **Remove black bars**: ignores letterboxing when picking colors.
-- **Frame rate limit**: how often the glow updates (15 by default). Higher values follow the video more closely but use more CPU.
+- **Frame rate limit**: the most times a second the glow updates (60 by default, so it follows every frame of the video). Lower values save CPU but look choppy on fast scenes.
 - **GPU acceleration, Use WebGPU**: leave both on unless the glow doesn't show up at all. Without WebGPU (or on Safari versions without it) the glow is drawn with WebGL.
-- **Crossfade between updates**: with WebGPU, each update fades in over the previous one, so the glow moves continuously. Turn it off to save a little more CPU; Smooth motion still softens the steps.
+- **Crossfade between updates**: with WebGPU, each update fades in over the previous one, so the glow moves continuously. It only kicks in below about 40 updates a second (24–30 fps videos, or a lower frame rate limit); faster than that it would add CPU without a visible difference.
 
 The settings panel is in English, or in Korean when YouTube itself is set to Korean.
 
