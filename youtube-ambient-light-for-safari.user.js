@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Ambient Light For Safari
 // @namespace    https://github.com/neul-lov/youtube-ambient-light-for-safari
-// @version      3.1.0
+// @version      3.1.1
 // @description  Ambient light (ambilight) for YouTube in Safari: the colors of the video glow around the player.
 // @author       neul-lov
 // @license      MIT
@@ -986,21 +986,59 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
     const smp = device.createSampler({ magFilter: "linear", minFilter: "linear" });
     const ubuf = (size) => device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const U = { mid: ubuf(32), src: ubuf(32), det: ubuf(32), chk: ubuf(32), wash: ubuf(32), project: ubuf(64), blur: ubuf(48), final: ubuf(48) };
-    const put = (b, values) => device.queue.writeBuffer(b, 0, new Float32Array(values));
+    // Every WebGPU object made per update (views, layouts, bind groups, descriptors) lives on in
+    // Safari's page process until garbage collection, which these small objects hardly trigger: at
+    // 60 updates a second that piled up as about 1 MB/s of memory. So everything that can be
+    // reused is: uniforms are written only when they change, views, layouts and descriptors are
+    // made once. What remains per update is what WebGPU needs: the frame (VideoFrame + external
+    // texture with its bind group), one command encoder, the passes and the canvas texture view.
+    const uniforms = new Map(); // buffer → last values written
+    const put = (b, values) => {
+      let last = uniforms.get(b);
+      if (!last) uniforms.set(b, (last = new Float32Array(b.size / 4)));
+      let changed = false;
+      for (let i = 0; i < values.length; i++) {
+        const v = Math.fround(values[i]);
+        if (last[i] !== v) {
+          last[i] = v;
+          changed = true;
+        }
+      }
+      if (changed) device.queue.writeBuffer(b, 0, last);
+    };
     const target = (w, h, fmt = "rgba8unorm", usage = 0) =>
       device.createTexture({ size: [w, h], format: fmt, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | usage });
+    const views = new WeakMap();
+    const viewOf = (tex) => {
+      let v = views.get(tex);
+      if (!v) views.set(tex, (v = tex.createView()));
+      return v;
+    };
+    const layouts = new Map();
+    const layoutOf = (pipeline) => {
+      let l = layouts.get(pipeline);
+      if (!l) layouts.set(pipeline, (l = pipeline.getBindGroupLayout(0)));
+      return l;
+    };
     const group = (pipeline, resource, buffer) =>
       device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
+        layout: layoutOf(pipeline),
         entries: [{ binding: 0, resource: smp }, { binding: 1, resource }, { binding: 2, resource: { buffer } }],
       });
+    const attachment = { view: null, loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 0] };
+    const passDesc = { colorAttachments: [attachment] };
+    const blendColor = [0, 0, 0, 0];
     const pass = (enc, view, pipeline, bindGroup, blend) => {
-      const rp = enc.beginRenderPass({
-        colorAttachments: [{ view, loadOp: blend === undefined ? "clear" : "load", storeOp: "store", clearValue: [0, 0, 0, 0] }],
-      });
+      attachment.view = view;
+      attachment.loadOp = blend === undefined ? "clear" : "load";
+      const rp = enc.beginRenderPass(passDesc);
+      attachment.view = null;
       rp.setPipeline(pipeline);
       rp.setBindGroup(0, bindGroup);
-      if (blend !== undefined) rp.setBlendConstant([blend, blend, blend, blend]);
+      if (blend !== undefined) {
+        blendColor.fill(blend);
+        rp.setBlendConstant(blendColor);
+      }
       rp.draw(4);
       rp.end();
     };
@@ -1092,6 +1130,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
     });
     let frame = null; // full-size copy of the video frame (copy mode)
     let videoKey = ""; // source and size of the video the checks below refer to
+    let keySrc = "", keyW = 0, keyH = 0;
     let extOK = false; // the external texture shows the current video
     let extBroken = false; // it doesn't (until the video changes)
     let checking = false;
@@ -1115,6 +1154,9 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
           buf.unmap();
           buf.destroy();
           return mx;
+        }, (e) => {
+          buf.destroy(); // mapping failed (device lost or destroyed): don't leave the buffer behind
+          throw e;
         });
     };
 
@@ -1127,7 +1169,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
         const w = Math.min(PROBE_W, vw), h = Math.min(PROBE_H, vh);
         const enc = encoder();
         put(U.chk, [0, 0, 1, 1, 1 / CHK_W / 4, 1 / CHK_H / 4, 0, 0]);
-        pass(enc, chk.createView(), P.ext8, group(P.ext8, ext, U.chk));
+        pass(enc, viewOf(chk), P.ext8, group(P.ext8, ext, U.chk));
         // Three regions along the diagonal, which stay clear of letterboxing bars
         for (let k = 0; k < 3; k++) {
           const origin = [Math.floor(((vw - w) * (k + 1)) / 4), Math.floor(((vh - h) * (k + 1)) / 4)];
@@ -1163,9 +1205,16 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
     };
 
     // A pass from the current video frame (external texture or copied frame) into `view`
+    let frameGroups = new Map(); // bind groups of the copied frame (made once per frame texture)
     const fromVideo = (view, toSrc, buf, blend) => {
       const pipeline = copyMode ? (toSrc ? P.midSrc : P.tex8) : toSrc ? P.extSrc : P.ext8;
-      pass(encoder(), view, pipeline, group(pipeline, copyMode ? frame.createView() : ext, buf), blend);
+      let g;
+      if (copyMode) {
+        const k = pipeline === P.tex8 ? buf : pipeline; // P.tex8 is used with several buffers
+        g = frameGroups.get(k);
+        if (!g) frameGroups.set(k, (g = group(pipeline, viewOf(frame), buf)));
+      } else g = group(pipeline, ext, buf);
+      pass(encoder(), view, pipeline, g, blend);
     };
 
     return {
@@ -1181,8 +1230,8 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
           sh = g.sh;
           if (src) src.destroy();
           src = target(sw, sh, "rgba16float");
-          gProject = group(P.project, src.createView(), U.project);
-          gWash = group(P.tex8, src.createView(), U.wash);
+          gProject = group(P.project, viewOf(src), U.project);
+          gWash = group(P.tex8, viewOf(src), U.wash);
           resized = true;
         }
         if (g.mw !== mw || g.mh !== mh) {
@@ -1190,7 +1239,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
           mh = g.mh;
           if (mid) mid.destroy();
           mid = mw ? target(mw, mh) : null;
-          gMid = mid ? group(P.midSrc, mid.createView(), U.src) : null;
+          gMid = mid ? group(P.midSrc, viewOf(mid), U.src) : null;
         }
         if (g.bw !== bw || g.bh !== bh || !proj) {
           bw = g.bw;
@@ -1203,8 +1252,8 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
           if (tmp) tmp.destroy();
           proj = target(bw, bh);
           tmp = target(bw, bh);
-          gBlur = group(P.blur, proj.createView(), U.blur);
-          gFinal = group(P.final, tmp.createView(), U.final);
+          gBlur = group(P.blur, viewOf(proj), U.blur);
+          gFinal = group(P.final, viewOf(tmp), U.final);
           fresh = true;
           resized = true;
         }
@@ -1216,8 +1265,12 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
         copyMode = false;
         if (lost || !src) return false;
         const vw = v.videoWidth, vh = v.videoHeight;
-        const key = v.currentSrc + "|" + vw + "x" + vh;
-        if (key !== videoKey) {
+        const srcUrl = v.currentSrc;
+        if (srcUrl !== keySrc || vw !== keyW || vh !== keyH) {
+          keySrc = srcUrl;
+          keyW = vw;
+          keyH = vh;
+          const key = srcUrl + "|" + vw + "x" + vh;
           // A new video, or a new resolution (which can come from another decoder): check again
           videoKey = key;
           extOK = extBroken = false;
@@ -1240,6 +1293,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
           if (!extOK) {
             if (!frame || frame.width !== vw || frame.height !== vh) {
               if (frame) frame.destroy();
+              frameGroups = new Map();
               frame = device.createTexture({
                 size: [vw, vh],
                 format: "rgba8unorm",
@@ -1271,7 +1325,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       detect() {
         if (lost || (!ext && !copyMode)) return null;
         put(U.det, [0, 0, 1, 1, 1 / DET_W / 4, 1 / DET_H / 4, 0, 0]);
-        fromVideo(det.createView(), false, U.det);
+        fromVideo(viewOf(det), false, U.det);
         const copied = detRB.copy(encoder());
         flush();
         if (copied) detRB.map();
@@ -1281,7 +1335,7 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
       sampleWash() {
         if (lost || !src) return null;
         put(U.wash, [0, 0, 1, 1, 1 / WASH_W / 4, 1 / WASH_ROWS / 4, 0, 0]);
-        pass(encoder(), washT.createView(), P.tex8, gWash);
+        pass(encoder(), viewOf(washT), P.tex8, gWash);
         const copied = washRB.copy(encoder());
         flush();
         if (copied) washRB.map();
@@ -1293,12 +1347,12 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
         const c = [crop.l, crop.t, 1 - crop.l - crop.r, 1 - crop.t - crop.b];
         if (mid) {
           put(U.mid, [...c, c[2] / mw / 4, c[3] / mh / 4, 0, 0]);
-          fromVideo(mid.createView(), false, U.mid);
+          fromVideo(viewOf(mid), false, U.mid);
           put(U.src, [0, 0, 1, 1, 1 / sw / 4, 1 / sh / 4, 0, 0]);
-          pass(encoder(), src.createView(), P.midSrc, gMid, a);
+          pass(encoder(), viewOf(src), P.midSrc, gMid, a);
         } else {
           put(U.src, [...c, c[2] / sw / 4, c[3] / sh / 4, 0, 0]);
-          fromVideo(src.createView(), true, U.src, a);
+          fromVideo(viewOf(src), true, U.src, a);
         }
       },
 
@@ -1334,8 +1388,8 @@ struct U { dir: vec2f, sigma: f32, pad: f32, adj: vec4f, bg: vec4f };
         const visible = topShown ? 1 : 0;
         const targets = fresh || (S.crossfade && paused) ? [0, 1] : fade ? [1 - visible] : [visible];
         const enc = encoder();
-        pass(enc, proj.createView(), P.project, gProject);
-        pass(enc, tmp.createView(), P.blur, gBlur);
+        pass(enc, viewOf(proj), P.project, gProject);
+        pass(enc, viewOf(tmp), P.blur, gBlur);
         for (const n of targets) pass(enc, ctx[n].getCurrentTexture().createView(), P.final, gFinal);
         flush();
         fresh = false;
